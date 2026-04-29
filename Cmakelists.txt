@@ -11,4 +11,7 @@ add_executable(NvEncodeTest test.cpp)
 
 target_include_directories(NvEncodeTest PRIVATE "${CMAKE_SOURCE_DIR}/include")
 
-target_link_libraries(NvEncodeTest PRIVATE "${CMAKE_SOURCE_DIR}/lib/nvEncodeAPI.lib")
+target_link_libraries(NvEncodeTest PRIVATE 
+    "${CMAKE_SOURCE_DIR}/lib/nvEncodeAPI.lib"
+    d3d11
+)
