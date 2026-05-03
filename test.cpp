@@ -1,25 +1,41 @@
 #include <iostream>
-#include <d3d11.h> // New: For DirectX 11
+#include <fstream>
+#include <d3d11.h> 
+#include <dxgi1_2.h> 
 #include "nvEncodeAPI.h"
 #include <vector>
-
+#include <wrl/client.h>
+using Microsoft::WRL::ComPtr;
 // Link the DirectX library (or add it to CMake)
 #pragma comment(lib, "d3d11.lib")
 
-#define CK_NVENC(cmd) do { \
-    NVENCSTATUS err = cmd; \
-    if (err != NV_ENC_SUCCESS) { \
-        std::cerr << "NVENC Error: " << err \
-                  << " at " << __FILE__ << ":" << __LINE__ \
-                  << " -> " << #cmd << std::endl; \
-        exit(1); \
-    } \
-} while(0)
+#define CK_NVENC(cmd) \
+    do { \
+        NVENCSTATUS err = cmd; \
+        if (err != NV_ENC_SUCCESS) { \
+            std::cerr << "NVENC Error: " << err \
+                    << " at " << __FILE__ << ":" << __LINE__ \
+                    << " -> " << #cmd << std::endl; \
+            exit(1); \
+        } \
+    } while(0)
+
+#define HR(expr)                                                    \
+    do {                                                            \
+        HRESULT _hr = (expr);                                       \
+        if (FAILED(_hr)) {                                          \
+            std::cerr << "FAILED: " #expr                           \
+                      << "  hr=0x" << std::hex << _hr << "\n";     \
+            return false;                                           \
+        }                                                           \
+    } while(0)
+
 
 int main() {
     // --- STEP 1: Create a D3D11 Device ---
-    ID3D11Device* pDevice = nullptr;
-    ID3D11DeviceContext* pContext = nullptr;
+    ComPtr<ID3D11Device> pDevice = nullptr;
+    ComPtr<ID3D11DeviceContext> pContext = nullptr;
+    ComPtr<IDXGIOutputDuplication> pDuplication = nullptr;
     D3D_FEATURE_LEVEL featureLevel;
 
     HRESULT hr = D3D11CreateDevice(
@@ -32,6 +48,16 @@ int main() {
         return 1;
     }
 
+    ComPtr<IDXGIDevice> dxgiDevice;
+    HR( pDevice.As(&dxgiDevice) );
+    ComPtr<IDXGIAdapter> adapter;
+    HR( dxgiDevice->GetAdapter(&adapter) );
+    ComPtr<IDXGIOutput> output;
+    HR( adapter->EnumOutputs(0, &output) );
+    ComPtr<IDXGIOutput1> output1;
+    HR( output.As(&output1) );
+    HR( output1->DuplicateOutput(pDevice.Get(), &pDuplication) );
+
     // --- STEP 2: Initialize NVENC ---
     NV_ENCODE_API_FUNCTION_LIST nvFunctions = { NV_ENCODE_API_FUNCTION_LIST_VER };
     CK_NVENC(NvEncodeAPICreateInstance(&nvFunctions));
@@ -40,7 +66,8 @@ int main() {
     void* hEncoder = nullptr;
     NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS sessionParams = { NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER };
     
-    sessionParams.device = pDevice;                // Pass the DirectX device here!
+    ID3D11Device* pTmpDevice = pDevice.Get();
+    sessionParams.device = pTmpDevice;                // Pass the DirectX device here!
     sessionParams.deviceType = NV_ENC_DEVICE_TYPE_DIRECTX; // Change type to DirectX
     sessionParams.apiVersion = NVENCAPI_VERSION;
     
@@ -102,10 +129,70 @@ int main() {
 
     std::cout << "Hardware Fully Prepared. Ready for pixels!" << std::endl;
 
+    std::ofstream outFile("capture.h264", std::ios::binary);
+    std::cout << "Starting capture for 600 frames (approx 10 seconds)..." << std::endl;
+
+    for (int i = 0; i < 600; ++i) {
+        DXGI_OUTDUPL_FRAME_INFO frameInfo;
+        ComPtr<IDXGIResource> pDesktopResource = nullptr;
+
+        HRESULT hr = pDuplication->AcquireNextFrame(100, &frameInfo, &pDesktopResource);
+        if (FAILED(hr)) continue;
+
+        ComPtr<ID3D11Texture2D> pAcquiredTexture;
+
+        if (FAILED(pDesktopResource.As(&pAcquiredTexture))) {
+            pDuplication->ReleaseFrame();
+            continue;
+        }
+
+        // --- STEP 4.1.2: Register & Map for Low-Copy ---
+        NV_ENC_REGISTER_RESOURCE regParam = { NV_ENC_REGISTER_RESOURCE_VER };
+        regParam.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
+        regParam.resourceToRegister = pAcquiredTexture.Get();
+        regParam.width = 1920;
+        regParam.height = 1080;
+        regParam.bufferFormat = NV_ENC_BUFFER_FORMAT_ARGB;
+        nvFunctions.nvEncRegisterResource(hEncoder, &regParam);
+
+        NV_ENC_MAP_INPUT_RESOURCE mapParam = { NV_ENC_MAP_INPUT_RESOURCE_VER };
+        mapParam.registeredResource = regParam.registeredResource;
+        nvFunctions.nvEncMapInputResource(hEncoder, &mapParam);
+
+        // --- STEP 4.3: Submit to GPU ---
+        NV_ENC_PIC_PARAMS picParams = { NV_ENC_PIC_PARAMS_VER };
+        picParams.inputBuffer = mapParam.mappedResource;
+        picParams.outputBitstream = hBitstreamBuffer;
+        picParams.bufferFmt = NV_ENC_BUFFER_FORMAT_ARGB; // REQUIRED: Match your registration[cite: 1]
+        picParams.inputWidth = 1920;  // Highly recommended[cite: 1]
+        picParams.inputHeight = 1080; // Highly recommended[cite: 1]
+        picParams.encodePicFlags = 0;
+
+        CK_NVENC(nvFunctions.nvEncEncodePicture(hEncoder, &picParams));
+        
+        //--- STEP 4.4: Retrieve and Save to Disk
+        NV_ENC_LOCK_BITSTREAM lockParams = { NV_ENC_LOCK_BITSTREAM_VER };
+        lockParams.outputBitstream = hBitstreamBuffer;
+        lockParams.doNotWait = 0; // Synchronous mode: wait for GPU to finish
+
+        CK_NVENC(nvFunctions.nvEncLockBitstream(hEncoder, &lockParams));
+        outFile.write((char*)lockParams.bitstreamBufferPtr, lockParams.bitstreamSizeInBytes);
+        CK_NVENC(nvFunctions.nvEncUnlockBitstream(hEncoder, hBitstreamBuffer));
+
+        CK_NVENC(nvFunctions.nvEncUnmapInputResource(hEncoder, mapParam.mappedResource));
+        CK_NVENC(nvFunctions.nvEncUnregisterResource(hEncoder, regParam.registeredResource));
+
+        pDuplication->ReleaseFrame();
+    }
+
+    NV_ENC_PIC_PARAMS eosParams = { NV_ENC_PIC_PARAMS_VER };
+    eosParams.encodePicFlags = NV_ENC_PIC_FLAG_EOS; // Signal the end[cite: 1]
+    nvFunctions.nvEncEncodePicture(hEncoder, &eosParams);
+
+    outFile.close();
+
     // Cleanup
     nvFunctions.nvEncDestroyEncoder(hEncoder);
-    pDevice->Release();
-    pContext->Release();
 
     return 0;
 }
