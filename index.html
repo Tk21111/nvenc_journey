@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC DXGI+NVENC Stream</title>
+    <style>
+        body {
+            background-color: #121212;
+            color: white;
+            font-family: sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin: 0;
+            padding: 20px;
+        }
+        video {
+            background-color: black;
+            width: 100%;
+            max-width: 1280px;
+            aspect-ratio: 16/9;
+            border: 2px solid #333;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+        }
+        .controls {
+            margin-top: 20px;
+            display: flex;
+            gap: 15px;
+        }
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+            border-radius: 5px;
+            border: none;
+            background-color: #007bff;
+            color: white;
+            font-weight: bold;
+        }
+        button:hover { background-color: #0056b3; }
+        #status { margin-bottom: 10px; color: #aaa; }
+    </style>
+</head>
+<body>
+
+    <h2>Low-Latency Desktop Stream</h2>
+    <div id="status">Status: Disconnected</div>
+    
+    <!-- Video player. muted/playsinline are required for autoplay in modern browsers -->
+    <video id="video-player" autoplay playsinline muted></video>
+
+    <div class="controls">
+        <button id="btn-a">Press 'A' Button</button>
+        <button id="btn-b">Press 'B' Button</button>
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('video-player');
+        const statusElement = document.getElementById('status');
+        
+        let pc;
+        let ws;
+        let inputChannel;
+
+        ws = new WebSocket('ws://localhost:8080');
+
+        ws.onopen = () => {
+            statusElement.innerText = "Status: Connected to Signaling Server. Waiting for Offer...";
+            
+            pc = new RTCPeerConnection({
+                iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+            });
+
+            // Handle incoming video track automatically
+            pc.ontrack = (event) => {
+                console.log("Track received!", event.track);
+                if (event.track.kind === 'video') {
+                    videoElement.srcObject = event.streams[0];
+                    statusElement.innerText = "Status: Streaming Live";
+                }
+            };
+
+            // Handle outgoing ICE candidates
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    ws.send(JSON.stringify({
+                        candidate: event.candidate.candidate,
+                        mid: event.candidate.sdpMid
+                    }));
+                }
+            };
+
+            // Handle the Data Channel automatically when the server offers it
+            pc.ondatachannel = (event) => {
+                inputChannel = event.channel;
+                console.log("Data Channel received:", inputChannel.label);
+                
+                inputChannel.onopen = () => console.log("Data channel open!");
+                inputChannel.onmessage = (e) => console.log("Message from server:", e.data);
+            };
+        };
+
+        // Handle incoming messages from C++
+        ws.onmessage = async (event) => {
+            const msg = JSON.parse(event.data);
+
+            if (msg.type === 'offer') {
+                // 1. Server sent an offer. Accept it.
+                await pc.setRemoteDescription(new RTCSessionDescription(msg));
+                
+                // 2. Create an Answer to send back
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                
+                // 3. Send the answer to the C++ server
+                ws.send(JSON.stringify({
+                    type: answer.type,
+                    sdp: answer.sdp
+                }));
+            } else if (msg.candidate) {
+                // Add ICE candidates from the server
+                await pc.addIceCandidate(new RTCIceCandidate({
+                    candidate: msg.candidate,
+                    sdpMid: msg.mid
+                }));
+            }
+        };
+
+        ws.onclose = () => {
+            statusElement.innerText = "Status: Disconnected";
+        };
+
+        // --- Input Simulation (Sending Binary Structs to C++) ---
+        function sendInputStruct(lx, ly, buttonA, buttonB) {
+            if (!inputChannel || inputChannel.readyState !== 'open') return;
+
+            const buffer = new ArrayBuffer(5);
+            const view = new DataView(buffer);
+
+            view.setInt16(0, lx, true);
+            view.setInt16(2, ly, true);
+
+            let buttons = 0;
+            if (buttonA) buttons |= (1 << 0);
+            if (buttonB) buttons |= (1 << 1);
+            
+            view.setUint8(4, buttons);
+            inputChannel.send(buffer);
+        }
+
+        document.getElementById('btn-a').addEventListener('mousedown', () => {
+            sendInputStruct(32767, 0, true, false); 
+        });
+        document.getElementById('btn-b').addEventListener('mousedown', () => {
+            sendInputStruct(0, -32767, false, true); 
+        });
+    </script>
+</body>
+</html>
