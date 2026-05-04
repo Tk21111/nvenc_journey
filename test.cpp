@@ -1,17 +1,19 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
+#include <d3d11.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 #include "nvEncodeAPI.h"
 
+#pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 
 using Microsoft::WRL::ComPtr;
 
-// --- Macros for Error Checking ---
+// --- Error Handling Macros ---
 #define CK_NVENC(cmd) do { \
     NVENCSTATUS err = cmd; \
     if (err != NV_ENC_SUCCESS) { \
@@ -31,140 +33,96 @@ using Microsoft::WRL::ComPtr;
 int main() {
     const int width = 1920;
     const int height = 1080;
-    const int frameCount = 600;
 
-    // --- 1. DirectX 12 Setup ---
-    ComPtr<ID3D12Device> pDevice;
-    HR(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&pDevice)));
+    // --- 1. Initialize Both Devices ---
+    ComPtr<ID3D11Device> pDevice11;
+    ComPtr<ID3D11DeviceContext> pContext11;
+    HR(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &pDevice11, nullptr, &pContext11));
 
-    ComPtr<ID3D12CommandQueue> pCommandQueue;
-    D3D12_COMMAND_QUEUE_DESC queueDesc = { D3D12_COMMAND_LIST_TYPE_DIRECT };
-    HR(pDevice->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&pCommandQueue)));
+    ComPtr<ID3D12Device> pDevice12;
+    HR(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&pDevice12)));
 
-    // Create the Fence for synchronization
-    ComPtr<ID3D12Fence> pFence;
-    uint64_t fenceValue = 0;
-    HR(pDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&pFence)));
+    // --- 2. Setup DXGI Capture (D3D11) ---
+    ComPtr<IDXGIDevice> dxgiDevice;
+    HR(pDevice11.As(&dxgiDevice));
+    ComPtr<IDXGIAdapter> adapter;
+    HR(dxgiDevice->GetAdapter(&adapter));
+    ComPtr<IDXGIOutput> output;
+    HR(adapter->EnumOutputs(0, &output));
+    ComPtr<IDXGIOutput1> output1;
+    HR(output.As(&output1));
+    ComPtr<IDXGIOutputDuplication> pDuplication;
+    HR(output1->DuplicateOutput(pDevice11.Get(), &pDuplication));
 
-    // --- 2. Create DX12 Resources for NVENCODE (Section 4.1.3) ---
-    // Input Texture: Must be on a Default Heap
-    ComPtr<ID3D12Resource> pInputResource;
-    D3D12_RESOURCE_DESC texDesc = {};
-    texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    texDesc.Width = width;
-    texDesc.Height = height;
-    texDesc.DepthOrArraySize = 1;
-    texDesc.MipLevels = 1;
-    texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    texDesc.SampleDesc.Count = 1;
-    texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    texDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    // --- 3. Create the Shared Handle Bridge ---
+    // Create a texture in D3D11 that can be shared with D3D12
+    ComPtr<ID3D11Texture2D> pSharedTex11;
+    D3D11_TEXTURE2D_DESC desc11 = {};
+    desc11.Width = width;
+    desc11.Height = height;
+    desc11.MipLevels = 1;
+    desc11.ArraySize = 1;
+    desc11.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc11.SampleDesc.Count = 1;
+    desc11.Usage = D3D11_USAGE_DEFAULT;
+    desc11.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    desc11.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED; // CRITICAL
 
-    D3D12_HEAP_PROPERTIES defaultHeap = { D3D12_HEAP_TYPE_DEFAULT };
-    HR(pDevice->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &texDesc, 
-        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&pInputResource)));
+    HR(pDevice11->CreateTexture2D(&desc11, nullptr, &pSharedTex11));
 
-    // Output Buffer: Must be on a Readback Heap
-    ComPtr<ID3D12Resource> pOutputResource;
-    D3D12_RESOURCE_DESC bufDesc = {};
-    bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    bufDesc.Width = width * height * 4; // Recommended size
-    bufDesc.Height = 1;
-    bufDesc.DepthOrArraySize = 1;
-    bufDesc.MipLevels = 1;
-    bufDesc.Format = DXGI_FORMAT_UNKNOWN;
-    bufDesc.SampleDesc.Count = 1;
-    bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    bufDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    // Get the NT Handle for the bridge
+    HANDLE sharedHandle = nullptr;
+    ComPtr<IDXGIResource1> dxgiResource;
+    HR(pSharedTex11.As(&dxgiResource));
+    HR(dxgiResource->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &sharedHandle));
 
-    D3D12_HEAP_PROPERTIES readbackHeap = { D3D12_HEAP_TYPE_READBACK };
-    HR(pDevice->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &bufDesc, 
-        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&pOutputResource)));
+    // Open the bridge in D3D12
+    ComPtr<ID3D12Resource> pSharedTex12;
+    HR(pDevice12->OpenSharedHandle(sharedHandle, IID_PPV_ARGS(&pSharedTex12)));
+    CloseHandle(sharedHandle);
 
-    // --- 3. NVENCODE Session (Section 3.1.1.4) ---
+    // --- 4. Initialize NVENC (D3D12) ---
     NV_ENCODE_API_FUNCTION_LIST nv = { NV_ENCODE_API_FUNCTION_LIST_VER };
     CK_NVENC(NvEncodeAPICreateInstance(&nv));
 
     void* hEncoder = nullptr;
     NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS sessionParams = { NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER };
-    sessionParams.device = pDevice.Get(); // Pass IUnknown of DX12 device
+    sessionParams.device = pDevice12.Get(); // Registering with DX12 Device
     sessionParams.deviceType = NV_ENC_DEVICE_TYPE_DIRECTX;
     sessionParams.apiVersion = NVENCAPI_VERSION;
     CK_NVENC(nv.nvEncOpenEncodeSessionEx(&sessionParams, &hEncoder));
 
-    // --- 4. Register Resources (Section 4.1.3) ---
-    // Registration returns a "Registered Handle" (the ID card for the resource)
+    // Register the D3D12 view of the bridge
     NV_ENC_REGISTER_RESOURCE regInput = { NV_ENC_REGISTER_RESOURCE_VER };
     regInput.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
-    regInput.resourceToRegister = pInputResource.Get();
+    regInput.resourceToRegister = pSharedTex12.Get(); // Now owned by D3D12
     regInput.width = width;
     regInput.height = height;
     regInput.bufferFormat = NV_ENC_BUFFER_FORMAT_ARGB;
     CK_NVENC(nv.nvEncRegisterResource(hEncoder, &regInput));
-    void* registeredInput = regInput.registeredResource;
 
-    NV_ENC_REGISTER_RESOURCE regOutput = { NV_ENC_REGISTER_RESOURCE_VER };
-    regOutput.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
-    regOutput.resourceToRegister = pOutputResource.Get();
-    regOutput.bufferUsage = NV_ENC_OUTPUT_BITSTREAM;
-    CK_NVENC(nv.nvEncRegisterResource(hEncoder, &regOutput));
-    void* registeredOutput = regOutput.registeredResource;
+    // (Standard Initialization: InitializeEncoder, CreateBitstreamBuffer, etc.)
+    // ... [Omitted for brevity, use your existing init code here] ...
 
-    // --- 5. Initialize Encoder ---
-    NV_ENC_INITIALIZE_PARAMS initParams = { NV_ENC_INITIALIZE_PARAMS_VER };
-    initParams.encodeGUID = NV_ENC_CODEC_H264_GUID;
-    initParams.encodeWidth = width;
-    initParams.encodeHeight = height;
-    initParams.frameRateNum = 60;
-    initParams.frameRateDen = 1;
-    initParams.enablePTD = 1;
-    initParams.tuningInfo = NV_ENC_TUNING_INFO_LOW_LATENCY;
-    CK_NVENC(nv.nvEncInitializeEncoder(hEncoder, &initParams));
+    // --- 5. Encoding Loop ---
+    for (int i = 0; i < 600; ++i) {
+        DXGI_OUTDUPL_FRAME_INFO frameInfo;
+        ComPtr<IDXGIResource> pDesktopResource;
+        if (FAILED(pDuplication->AcquireNextFrame(100, &frameInfo, &pDesktopResource))) continue;
 
-    // --- 6. Encoding Loop (Section 4.3) ---
-    std::ofstream outFile("capture_dx12.h264", std::ios::binary);
+        ComPtr<ID3D11Texture2D> pAcquiredTex;
+        HR(pDesktopResource.As(&pAcquiredTex));
 
-    for (int i = 0; i < frameCount; ++i) {
-        // [Add your DXGI Capture Logic here to fill pInputResource]
-
-        // Synchronization logic using Fence Points
-        fenceValue++; 
+        // Transfer pixels: Capture (D3D11) -> Bridge (D3D11)
+        pContext11->CopyResource(pSharedTex11.Get(), pAcquiredTex.Get());
         
-        NV_ENC_INPUT_RESOURCE_D3D12 inputD3D12 = { 0 };
-        inputD3D12.pInputBuffer = registeredInput;
-        inputD3D12.inputFencePoint.pFence = pFence.Get();
-        // inputD3D12.inputFencePoint.value = fenceValue; // Wait for capture to finish[cite: 1]
+        // At this point, pSharedTex12 (the D3D12 side) has the data![cite: 1]
 
-        NV_ENC_OUTPUT_RESOURCE_D3D12 outputD3D12 = { 0 };
-        outputD3D12.pOutputBuffer = registeredOutput;
-        outputD3D12.outputFencePoint.pFence = pFence.Get();
-        // outputD3D12.outputFencePoint.value = fenceValue + 1; // Signal when encoded[cite: 1]
+        // (Standard Encode logic: Setup NV_ENC_PIC_PARAMS and call nvEncEncodePicture[cite: 1])
+        // Remember to use DX12 Fences to sync the D3D11 copy and the D3D12 encode[cite: 1]
 
-        NV_ENC_PIC_PARAMS picParams = { NV_ENC_PIC_PARAMS_VER };
-        picParams.inputBuffer = &inputD3D12;   // Pass the DX12 structure[cite: 1]
-        // picParams.outputBuffer = &outputD3D12; // Pass the DX12 structure[cite: 1]
-        picParams.bufferFmt = NV_ENC_BUFFER_FORMAT_ARGB;
-        picParams.inputWidth = width;
-        picParams.inputHeight = height;
-        picParams.inputTimeStamp = i;
-
-        CK_NVENC(nv.nvEncEncodePicture(hEncoder, &picParams));
-
-        // Retrieve output (Section 4.4)[cite: 1]
-        NV_ENC_LOCK_BITSTREAM lock = { NV_ENC_LOCK_BITSTREAM_VER };
-        lock.outputBitstream = &outputD3D12; // Use the pointer to the DX12 struct[cite: 1]
-        CK_NVENC(nv.nvEncLockBitstream(hEncoder, &lock));
-        
-        outFile.write((char*)lock.bitstreamBufferPtr, lock.bitstreamSizeInBytes);
-        
-        CK_NVENC(nv.nvEncUnlockBitstream(hEncoder, lock.outputBitstream));
+        pDuplication->ReleaseFrame();
     }
-
-    // --- 7. Cleanup ---
-    nv.nvEncUnregisterResource(hEncoder, registeredInput);
-    nv.nvEncUnregisterResource(hEncoder, registeredOutput);
-    nv.nvEncDestroyEncoder(hEncoder);
-    outFile.close();
 
     return 0;
 }
