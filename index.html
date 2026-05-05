@@ -70,16 +70,22 @@
             statusElement.innerText = "Status: Connected to Signaling Server. Waiting for Offer...";
             
             pc = new RTCPeerConnection({
-                iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+                iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
             });
 
             // Handle incoming video track automatically
             pc.ontrack = (event) => {
                 console.log("Track received!", event.track);
                 if (event.track.kind === 'video') {
-                    videoElement.srcObject = event.streams[0];
+                    if (event.streams && event.streams.length > 0) {
+                        videoElement.srcObject = event.streams[0];
+                    } else {
+                        videoElement.srcObject = new MediaStream([event.track]);
+                    }
+                    videoElement.play();
                     statusElement.innerText = "Status: Streaming Live";
                 }
+                
             };
 
             // Handle outgoing ICE candidates

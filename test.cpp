@@ -106,6 +106,7 @@ int main() {
         dc->onOpen([dc](){
             cout << "[dataCh] open\n";
             dc->send("Hello from Server");
+            dc->send("aaa");
         });
 
         dc->onMessage([](auto msg){
@@ -182,12 +183,37 @@ int main() {
 
     NV_ENC_INITIALIZE_PARAMS initParams = { NV_ENC_INITIALIZE_PARAMS_VER };
     initParams.encodeGUID = NV_ENC_CODEC_H264_GUID;
+    initParams.presetGUID = NV_ENC_PRESET_P3_GUID;
     initParams.encodeWidth = 1920;
     initParams.encodeHeight = 1080;
     initParams.tuningInfo = NV_ENC_TUNING_INFO_LOW_LATENCY;
     initParams.frameRateNum = 60;
     initParams.frameRateDen = 1;
-    initParams.enablePTD = 1; // Picture Type Decision (auto I/P frames)
+    initParams.enablePTD = 1;
+
+    NV_ENC_PRESET_CONFIG presetConfig = { NV_ENC_PRESET_CONFIG_VER, { NV_ENC_CONFIG_VER } };
+    presetConfig.presetCfg.version = NV_ENC_CONFIG_VER;
+    CK_NVENC(nv.nvEncGetEncodePresetConfigEx(
+        hEncoder, 
+        NV_ENC_CODEC_H264_GUID, 
+        NV_ENC_PRESET_P1_GUID, 
+        NV_ENC_TUNING_INFO_LOW_LATENCY, 
+        &presetConfig
+    ));
+
+    initParams.encodeConfig = &presetConfig.presetCfg;    
+    initParams.encodeConfig->encodeCodecConfig.h264Config.repeatSPSPPS = 1;
+    
+
+    // 5. Force a Keyframe every 60 frames (1 second). Without this, the stream never starts.
+    initParams.encodeConfig->encodeCodecConfig.h264Config.idrPeriod = 60;
+    initParams.encodeConfig->rcParams.averageBitRate = 5000000;
+    initParams.encodeConfig->rcParams.maxBitRate = 5000000;
+    
+    // Set VBV buffer size tight for low latency (averageBitRate / framerate)
+    initParams.encodeConfig->rcParams.vbvBufferSize = 5000000 / 60;
+    initParams.encodeConfig->rcParams.vbvInitialDelay = 5000000 / 60;
+
     CK_NVENC(nv.nvEncInitializeEncoder(hEncoder, &initParams));
 
     NV_ENC_CREATE_BITSTREAM_BUFFER cb = { NV_ENC_CREATE_BITSTREAM_BUFFER_VER };
@@ -265,6 +291,9 @@ int main() {
 
         if (lock.bitstreamSizeInBytes > 0) {
             // cout << "send" << endl;
+            // static std::ofstream dumpFile("debug_stream.h264", std::ios::binary | std::ios::app);
+            // dumpFile.write(reinterpret_cast<const char*>(lock.bitstreamBufferPtr), lock.bitstreamSizeInBytes);
+            // dumpFile.flush();
             BroadcastH264Frame(lock.bitstreamBufferPtr, lock.bitstreamSizeInBytes);
         }
 
