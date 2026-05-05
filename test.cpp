@@ -38,6 +38,8 @@ struct Peer {
 
 map<shared_ptr<WebSocket>, Peer> peers;
 std::mutex peersMutex; // Protects the peers map from cross-thread crashes
+std::atomic<bool> forceIDR{false};
+
 
 // Helper to broadcast H.264 NAL units to all connected WebRTC clients
 void BroadcastH264Frame(const void* h264Data, size_t sizeInBytes) {
@@ -51,6 +53,7 @@ void BroadcastH264Frame(const void* h264Data, size_t sizeInBytes) {
 }
 
 int main() {
+
     // ========================================================================
     // 1. WEBRTC SERVER SETUP
     // ========================================================================
@@ -128,6 +131,7 @@ int main() {
                 auto msg = json::parse(get<string>(data));
                 if (msg.contains("type") && msg.contains("sdp")) {
                     pc->setRemoteDescription(Description(msg["sdp"].get<string>(), msg["type"].get<string>()));
+                    forceIDR = true;
                 } else if (msg.contains("candidate")) {
                     pc->addRemoteCandidate(Candidate(msg["candidate"].get<string>(), msg["mid"].get<string>()));
                 }
@@ -206,7 +210,7 @@ int main() {
     
 
     // 5. Force a Keyframe every 60 frames (1 second). Without this, the stream never starts.
-    initParams.encodeConfig->encodeCodecConfig.h264Config.idrPeriod = 60;
+    initParams.encodeConfig->encodeCodecConfig.h264Config.idrPeriod = 60;    
     initParams.encodeConfig->rcParams.averageBitRate = 5000000;
     initParams.encodeConfig->rcParams.maxBitRate = 5000000;
     
@@ -242,36 +246,69 @@ int main() {
     reg.bufferFormat = NV_ENC_BUFFER_FORMAT_ARGB; 
     CK_NVENC(nv.nvEncRegisterResource(hEncoder, &reg));
 
-    NV_ENC_MAP_INPUT_RESOURCE map = { NV_ENC_MAP_INPUT_RESOURCE_VER };
-    map.registeredResource = reg.registeredResource;
-    CK_NVENC(nv.nvEncMapInputResource(hEncoder, &map));
-
     cout << "Starting Video Capture & Stream loop..." << endl;
 
     // ========================================================================
     // 4. MAIN CAPTURE & STREAMING LOOP
     // ========================================================================
+    std::cout << "Creating Named Pipe for FFplay..." << std::endl;
+    HANDLE hPipe = CreateNamedPipeA(
+        "\\\\.\\pipe\\nvenc_debug", // Name of the pipe
+        PIPE_ACCESS_OUTBOUND,      // Server writes, client reads
+        PIPE_TYPE_BYTE | PIPE_WAIT,
+        1,                         // Only allow 1 instance (ffplay)
+        1024 * 1024 * 5,           // 5MB Out buffer
+        1024 * 1024 * 5,           // 5MB In buffer
+        0, NULL);
+
+    if (hPipe == INVALID_HANDLE_VALUE) {
+        std::cerr << "Failed to create debug pipe." << std::endl;
+    } else {
+        std::cout << "Waiting for FFplay to connect to the pipe..." << std::endl;
+        std::cout << "--> RUN THIS COMMAND IN TERMINAL: ffplay -f h264 -i \\\\.\\pipe\\nvenc_debug" << std::endl;
+        
+        // This will PAUSE your C++ program here until you run the ffplay command!
+        ConnectNamedPipe(hPipe, NULL); 
+        std::cout << "FFplay connected! Starting capture loop." << std::endl;
+    }
+    // ------------------------
+
+    const auto frameDuration = std::chrono::microseconds(16666); 
+    auto nextFrameTime = std::chrono::steady_clock::now();
+
     while (true) {
+        auto now = std::chrono::steady_clock::now();
+        if (now < nextFrameTime) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
+        
+        // PACER FIX: Set time relative to NOW. Never burst frames to catch up.
+        nextFrameTime = std::chrono::steady_clock::now() + frameDuration; 
+
         DXGI_OUTDUPL_FRAME_INFO frameInfo;
         ComPtr<IDXGIResource> pDesktopResource;
         
-        // Wait up to 10ms for a new frame. If the screen hasn't changed, DXGI returns a timeout.
-        HRESULT acquireResult = pDuplication->AcquireNextFrame(10, &frameInfo, &pDesktopResource);
+        HRESULT acquireResult = pDuplication->AcquireNextFrame(0, &frameInfo, &pDesktopResource);
         
-        if (acquireResult == DXGI_ERROR_WAIT_TIMEOUT) {
-            continue; // No screen update, just loop again
-        } else if (FAILED(acquireResult)) {
+        if (SUCCEEDED(acquireResult)) {
+            ComPtr<ID3D11Texture2D> pAcquiredTex;
+            pDesktopResource.As(&pAcquiredTex);
+            
+            // This copy now works perfectly because NVENC is not locking the texture!
+            pContext->CopyResource(pEncodeTexture.Get(), pAcquiredTex.Get());
+            pDuplication->ReleaseFrame();
+        } 
+        else if (acquireResult != DXGI_ERROR_WAIT_TIMEOUT) {
             cerr << "Lost DXGI capture. Needs reinitialization." << endl;
             break; 
         }
 
-        ComPtr<ID3D11Texture2D> pAcquiredTex;
-        pDesktopResource.As(&pAcquiredTex);
+        // --- GPU DEADLOCK FIX: Map the texture just before encoding ---
+        NV_ENC_MAP_INPUT_RESOURCE map = { NV_ENC_MAP_INPUT_RESOURCE_VER };
+        map.registeredResource = reg.registeredResource;
+        CK_NVENC(nv.nvEncMapInputResource(hEncoder, &map));
 
-        // Copy the acquired desktop frame into our mapped NVENC texture
-        pContext->CopyResource(pEncodeTexture.Get(), pAcquiredTex.Get());
-
-        // Setup picture params
         NV_ENC_PIC_PARAMS pic = { NV_ENC_PIC_PARAMS_VER };
         pic.inputBuffer = map.mappedResource;
         pic.bufferFmt = NV_ENC_BUFFER_FORMAT_ARGB;
@@ -280,32 +317,37 @@ int main() {
         pic.pictureStruct = NV_ENC_PIC_STRUCT_FRAME; 
         pic.outputBitstream = cb.bitstreamBuffer;
 
-        // Encode
+        pic.encodePicFlags = 0;
+        if (forceIDR) {
+            pic.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
+            forceIDR = false;
+        }
+
         CK_NVENC(nv.nvEncEncodePicture(hEncoder, &pic));
 
-        // Lock, Broadcast to WebRTC, and Unlock
         NV_ENC_LOCK_BITSTREAM lock = { NV_ENC_LOCK_BITSTREAM_VER };
         lock.outputBitstream = cb.bitstreamBuffer;
         CK_NVENC(nv.nvEncLockBitstream(hEncoder, &lock));
-        // cout << "load" << endl;
 
         if (lock.bitstreamSizeInBytes > 0) {
-            // cout << "send" << endl;
-            // static std::ofstream dumpFile("debug_stream.h264", std::ios::binary | std::ios::app);
-            // dumpFile.write(reinterpret_cast<const char*>(lock.bitstreamBufferPtr), lock.bitstreamSizeInBytes);
-            // dumpFile.flush();
             BroadcastH264Frame(lock.bitstreamBufferPtr, lock.bitstreamSizeInBytes);
+
+            // Send to FFplay
+            if (hPipe != INVALID_HANDLE_VALUE) {
+                DWORD bytesWritten;
+                WriteFile(hPipe, lock.bitstreamBufferPtr, lock.bitstreamSizeInBytes, &bytesWritten, NULL);
+            }
         }
 
         CK_NVENC(nv.nvEncUnlockBitstream(hEncoder, cb.bitstreamBuffer));
-
-        pDuplication->ReleaseFrame();
+        
+        // --- GPU DEADLOCK FIX: Unmap the texture so DXGI can safely use it next frame ---
+        CK_NVENC(nv.nvEncUnmapInputResource(hEncoder, map.mappedResource));
     }
 
     // ========================================================================
     // 5. CLEANUP
     // ========================================================================
-    nv.nvEncUnmapInputResource(hEncoder, map.mappedResource);
     nv.nvEncUnregisterResource(hEncoder, reg.registeredResource);
     nv.nvEncDestroyBitstreamBuffer(hEncoder, cb.bitstreamBuffer);
     nv.nvEncDestroyEncoder(hEncoder);
