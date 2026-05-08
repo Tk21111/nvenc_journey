@@ -17,8 +17,12 @@
 #include <wrl/client.h>
 #include "nvEncodeAPI.h"
 
+#include <mmsystem.h>
+
+#pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
+
 
 using json = nlohmann::json;
 using namespace rtc;
@@ -54,6 +58,7 @@ void BroadcastH264Frame(const void* h264Data, size_t sizeInBytes) {
 
 int main() {
 
+    timeBeginPeriod(1);
     // ========================================================================
     // 1. WEBRTC SERVER SETUP
     // ========================================================================
@@ -79,8 +84,10 @@ int main() {
         auto rtpConfig = std::make_shared<rtc::RtpPacketizationConfig>(
             42, "video-send", 96, rtc::H264RtpPacketizer::defaultClockRate
         );
+
+        // Change from LongStartSequence to StartSequence to support NVENC P-frames
         auto packetizer = std::make_shared<rtc::H264RtpPacketizer>(
-            rtc::NalUnit::Separator::LongStartSequence, rtpConfig
+            rtc::NalUnit::Separator::StartSequence, rtpConfig
         );
         videoTrack->setMediaHandler(packetizer);
 
@@ -125,6 +132,13 @@ int main() {
 
         pc->setLocalDescription();
 
+        pc->onStateChange([](rtc::PeerConnection::State state) {
+            if (state == rtc::PeerConnection::State::Connected) {
+                std::cout << "\n[WebRTC] NETWORK CONNECTED! Blasting Keyframe...\n" << std::endl;
+                forceIDR = true;
+            }
+        });
+
         ws->onMessage([pc](auto data) {
             if (!holds_alternative<string>(data)) return;
             try {
@@ -161,7 +175,7 @@ int main() {
     ComPtr<IDXGIAdapter> adapter;
     dxgiDevice->GetAdapter(&adapter);
     ComPtr<IDXGIOutput> output;
-    adapter->EnumOutputs(0, &output);
+    adapter->EnumOutputs(1, &output);
     ComPtr<IDXGIOutput1> output1;
     output.As(&output1);
     
@@ -191,7 +205,7 @@ int main() {
     initParams.encodeWidth = 1920;
     initParams.encodeHeight = 1080;
     initParams.tuningInfo = NV_ENC_TUNING_INFO_LOW_LATENCY;
-    initParams.frameRateNum = 60;
+    initParams.frameRateNum = 30;
     initParams.frameRateDen = 1;
     initParams.enablePTD = 1;
 
@@ -206,17 +220,23 @@ int main() {
     ));
 
     initParams.encodeConfig = &presetConfig.presetCfg;    
+    initParams.encodeConfig->profileGUID = NV_ENC_H264_PROFILE_BASELINE_GUID;
+
+    initParams.encodeConfig->gopLength = 300;            
+    initParams.encodeConfig->encodeCodecConfig.h264Config.idrPeriod = 300;
     initParams.encodeConfig->encodeCodecConfig.h264Config.repeatSPSPPS = 1;
+    // Prevent NVENC from injecting AUD NAL units, which confuse WebRTC packetizers
+    initParams.encodeConfig->encodeCodecConfig.h264Config.outputAUD = 0;
     
 
     // 5. Force a Keyframe every 60 frames (1 second). Without this, the stream never starts.
-    initParams.encodeConfig->encodeCodecConfig.h264Config.idrPeriod = 60;    
+    initParams.encodeConfig->encodeCodecConfig.h264Config.enableIntraRefresh = 0;  
     initParams.encodeConfig->rcParams.averageBitRate = 5000000;
     initParams.encodeConfig->rcParams.maxBitRate = 5000000;
     
     // Set VBV buffer size tight for low latency (averageBitRate / framerate)
-    initParams.encodeConfig->rcParams.vbvBufferSize = 5000000 / 60;
-    initParams.encodeConfig->rcParams.vbvInitialDelay = 5000000 / 60;
+    initParams.encodeConfig->rcParams.vbvBufferSize = 5000000 / 30;
+    initParams.encodeConfig->rcParams.vbvInitialDelay = 5000000 / 30;
 
     CK_NVENC(nv.nvEncInitializeEncoder(hEncoder, &initParams));
 
@@ -273,18 +293,30 @@ int main() {
     }
     // ------------------------
 
-    const auto frameDuration = std::chrono::microseconds(16666); 
+    const auto frameDuration = std::chrono::microseconds(33333); 
     auto nextFrameTime = std::chrono::steady_clock::now();
 
     while (true) {
+        // --- HIGH PRECISION PACER ---
         auto now = std::chrono::steady_clock::now();
+        
         if (now < nextFrameTime) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
+            auto timeRemaining = std::chrono::duration_cast<std::chrono::milliseconds>(nextFrameTime - now).count();
+            
+            // If we have more than 2ms to wait, let the CPU rest (safely, since we boosted the timer)
+            if (timeRemaining > 2) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            } else {
+                // We are less than 2ms away! Spin-wait for perfect microsecond accuracy
+                while (std::chrono::steady_clock::now() < nextFrameTime) {
+                    std::this_thread::yield(); 
+                }
+            }
         }
         
-        // PACER FIX: Set time relative to NOW. Never burst frames to catch up.
-        nextFrameTime = std::chrono::steady_clock::now() + frameDuration; 
+        // Advance the clock strictly by 16.6ms to prevent drift
+        nextFrameTime += frameDuration;
 
         DXGI_OUTDUPL_FRAME_INFO frameInfo;
         ComPtr<IDXGIResource> pDesktopResource;

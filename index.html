@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WebRTC DXGI+NVENC Stream</title>
+    <title>WebRTC DXGI+NVENC Stream (WebCodecs)</title>
     <style>
         body {
             background-color: #121212;
@@ -15,7 +15,7 @@
             margin: 0;
             padding: 20px;
         }
-        video {
+        canvas {
             background-color: black;
             width: 100%;
             max-width: 1280px;
@@ -45,11 +45,11 @@
 </head>
 <body>
 
-    <h2>Low-Latency Desktop Stream</h2>
+    <h2>Low-Latency Desktop Stream (WebCodecs API)</h2>
     <div id="status">Status: Disconnected</div>
     
-    <!-- Video player. muted/playsinline are required for autoplay in modern browsers -->
-    <video id="video-player" autoplay playsinline muted></video>
+    <!-- Replaced <video> with <canvas> for WebCodecs rendering -->
+    <canvas id="video-canvas" width="1920" height="1080"></canvas>
 
     <div class="controls">
         <button id="btn-a">Press 'A' Button</button>
@@ -57,35 +57,73 @@
     </div>
 
     <script>
-        const videoElement = document.getElementById('video-player');
+        const canvas = document.getElementById('video-canvas');
+        const ctx = canvas.getContext('2d', { alpha: false }); // alpha: false heavily optimizes rendering
         const statusElement = document.getElementById('status');
         
         let pc;
         let ws;
         let inputChannel;
 
-        ws = new WebSocket('ws://localhost:8080');
+        // 1. Setup the GPU Hardware Decoder (WebCodecs)
+        const decoder = new VideoDecoder({
+            output(frame) {
+                // Instantly paint the decoded frame to the canvas
+                ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+                frame.close(); // CRITICAL: Free GPU memory
+            },
+            error(e) {
+                console.error("WebCodecs Decoder Error:", e);
+                statusElement.innerText = "Status: Decoder Error - Check Console";
+            }
+        });
+
+        // Configure the decoder for 1080p Baseline Profile (Level 4.2)
+        decoder.configure({
+            codec: 'avc1.42E02A', 
+            hardwareAcceleration: 'prefer-hardware'
+        });
+
+        ws = new WebSocket('ws://192.168.1.105:8080');
 
         ws.onopen = () => {
             statusElement.innerText = "Status: Connected to Signaling Server. Waiting for Offer...";
             
+            // 2. Enable encodedInsertableStreams in WebRTC config
             pc = new RTCPeerConnection({
                 iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+                encodedInsertableStreams: true 
             });
 
             // Handle incoming video track automatically
             pc.ontrack = (event) => {
                 console.log("Track received!", event.track);
                 if (event.track.kind === 'video') {
-                    if (event.streams && event.streams.length > 0) {
-                        videoElement.srcObject = event.streams[0];
-                    } else {
-                        videoElement.srcObject = new MediaStream([event.track]);
+                    statusElement.innerText = "Status: Hardware Decoding via WebCodecs";
+
+                    // 3. Intercept the raw network stream
+                    const receiver = event.receiver;
+                    const { readable } = receiver.createEncodedStreams();
+                    const reader = readable.getReader();
+
+                    // 4. Feed the raw network packets directly into the GPU
+                    async function processNetworkStream() {
+                        while (true) {
+                            const { done, value } = await reader.read();
+                            if (done) break;
+
+                            const chunk = new EncodedVideoChunk({
+                                type: value.type, // 'key' or 'delta'
+                                timestamp: value.timestamp,
+                                data: value.data
+                            });
+
+                            decoder.decode(chunk);
+                        }
                     }
-                    videoElement.play();
-                    statusElement.innerText = "Status: Streaming Live";
+
+                    processNetworkStream();
                 }
-                
             };
 
             // Handle outgoing ICE candidates
