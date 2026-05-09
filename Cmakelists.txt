@@ -4,7 +4,8 @@ cmake_minimum_required(VERSION 3.10)
 project(NvEncodeTest)
 
 # 2. Set the C++ standard
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(FetchContent)
@@ -15,18 +16,41 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(datachannel)
 
-add_executable(NvEncodeTest test.cpp)
+set(USE_GNUTLS OFF CACHE BOOL "" FORCE)
+set(USE_NICE OFF CACHE BOOL "" FORCE)
+set(NO_EXAMPLES ON CACHE BOOL "" FORCE)
+set(NO_TESTS ON CACHE BOOL "" FORCE)
+add_subdirectory(external/ViGEmClient)
 
-target_include_directories(NvEncodeTest PRIVATE "${CMAKE_SOURCE_DIR}/include")
+add_executable(NvEncodeTest 
+    src/main.cpp
+    input/controller.cpp
+    input/touch.cpp
+)
+
+target_include_directories(NvEncodeTest PRIVATE 
+    "${CMAKE_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/include"
+    external/ViGEmClient/include
+)
 
 target_link_libraries(NvEncodeTest PRIVATE 
     "${CMAKE_SOURCE_DIR}/lib/nvEncodeAPI.lib"
     d3d11
     datachannel
+
+    ViGEmClient
+    setupapi
 )
 
 add_custom_command(TARGET NvEncodeTest POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
     $<TARGET_FILE:datachannel>
     $<TARGET_FILE_DIR:NvEncodeTest>
+)
+
+target_compile_definitions(NvEncodeTest PRIVATE
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+    _WIN32_WINNT=0x0A00
 )

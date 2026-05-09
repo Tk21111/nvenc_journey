@@ -6,12 +6,12 @@
 #include <thread>
 #include <chrono>
 
-// WebRTC Includes
 #include <rtc/rtc.hpp>
 #include <rtc/h264rtppacketizer.hpp>
 #include <nlohmann/json.hpp>
+#include "input/controller.hpp"
+#include "input/touch.hpp"
 
-// DirectX / NVENC Includes
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
@@ -59,14 +59,24 @@ void BroadcastH264Frame(const void* h264Data, size_t sizeInBytes) {
 int main() {
 
     timeBeginPeriod(1);
-    // ========================================================================
-    // 1. WEBRTC SERVER SETUP
-    // ========================================================================
+
+    Controller controller;
+    if (!controller.Init()) {
+        std::cerr << "[input] ViGEm init failed\n";
+        return 1;
+    }
+
+    Touch touch;
+    if (!touch.Init(1920, 1080)) {
+        std::cerr << "[input] touch init failed\n";
+        return 1;
+    }
+
     WebSocketServer::Configuration wsConfig;
     wsConfig.port = 8080;
     auto wss = std::make_shared<WebSocketServer>(wsConfig);
 
-    wss->onClient([](shared_ptr<WebSocket> ws) {
+    wss->onClient([&](shared_ptr<WebSocket> ws) {
         cout << "[ws] new ws client connected" << endl;
 
         Configuration config;
@@ -119,15 +129,38 @@ int main() {
             dc->send("aaa");
         });
 
-        dc->onMessage([](auto msg){
-            auto &data = get<rtc::binary>(msg);
-            struct Packet {
-                int16_t lx; int16_t ly; uint8_t buttons;
-            };
-            Packet* p = (Packet*)data.data();
-            bool A = p->buttons & (1<<0);
-            bool B = p->buttons & (1<<1);
-            // std::cout << "Input: lx=" << p->lx << " ly=" << p->ly << " A=" << A << " B=" << B << "\n";
+        dc->onMessage([&] (rtc::message_variant msg){
+            // Only handle binary messages
+            if (!std::holds_alternative<rtc::binary>(msg)) return;
+
+            auto& data = std::get<rtc::binary>(msg);
+
+     
+                std::cout << "[peer] Packet #"
+                          << " - Size: " << data.size() 
+                          << " bytes (expected: " << sizeof(InputPacket) << ")\n" << std::endl;
+            
+
+            if (data.size() < sizeof(InputPacket)) return;
+
+            InputPacket packet{};
+            std::memcpy(&packet, data.data(), sizeof(InputPacket));
+
+                std::cout << "[peer] Deserialized - lx:" << packet.lx 
+                          << " ly:" << packet.ly
+                          << " dx:" << packet.dx
+                          << " dy:" << packet.dy
+                          << " buttons:0x" << std::hex << (int)packet.buttons << std::dec
+                          << "\n" << std::endl;
+
+            try {
+                controller.Update(packet);
+                touch.Update(packet.points);
+            }
+            catch (const std::exception& e) {
+                std::cerr << "OnInput callback error: " << e.what() << '\n';
+            }
+            
         });
 
         pc->setLocalDescription();
@@ -268,31 +301,6 @@ int main() {
 
     cout << "Starting Video Capture & Stream loop..." << endl;
 
-    // ========================================================================
-    // 4. MAIN CAPTURE & STREAMING LOOP
-    // ========================================================================
-    std::cout << "Creating Named Pipe for FFplay..." << std::endl;
-    HANDLE hPipe = CreateNamedPipeA(
-        "\\\\.\\pipe\\nvenc_debug", // Name of the pipe
-        PIPE_ACCESS_OUTBOUND,      // Server writes, client reads
-        PIPE_TYPE_BYTE | PIPE_WAIT,
-        1,                         // Only allow 1 instance (ffplay)
-        1024 * 1024 * 5,           // 5MB Out buffer
-        1024 * 1024 * 5,           // 5MB In buffer
-        0, NULL);
-
-    if (hPipe == INVALID_HANDLE_VALUE) {
-        std::cerr << "Failed to create debug pipe." << std::endl;
-    } else {
-        std::cout << "Waiting for FFplay to connect to the pipe..." << std::endl;
-        std::cout << "--> RUN THIS COMMAND IN TERMINAL: ffplay -f h264 -i \\\\.\\pipe\\nvenc_debug" << std::endl;
-        
-        // This will PAUSE your C++ program here until you run the ffplay command!
-        ConnectNamedPipe(hPipe, NULL); 
-        std::cout << "FFplay connected! Starting capture loop." << std::endl;
-    }
-    // ------------------------
-
     const auto frameDuration = std::chrono::microseconds(33333); 
     auto nextFrameTime = std::chrono::steady_clock::now();
 
@@ -365,10 +373,10 @@ int main() {
             BroadcastH264Frame(lock.bitstreamBufferPtr, lock.bitstreamSizeInBytes);
 
             // Send to FFplay
-            if (hPipe != INVALID_HANDLE_VALUE) {
-                DWORD bytesWritten;
-                WriteFile(hPipe, lock.bitstreamBufferPtr, lock.bitstreamSizeInBytes, &bytesWritten, NULL);
-            }
+            // if (hPipe != INVALID_HANDLE_VALUE) {
+            //     DWORD bytesWritten;
+            //     WriteFile(hPipe, lock.bitstreamBufferPtr, lock.bitstreamSizeInBytes, &bytesWritten, NULL);
+            // }
         }
 
         CK_NVENC(nv.nvEncUnlockBitstream(hEncoder, cb.bitstreamBuffer));
