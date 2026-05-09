@@ -2,70 +2,174 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WebRTC DXGI+NVENC Stream (WebCodecs)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>WebRTC DXGI+NVENC Stream with Xbox UI</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/nipplejs/0.10.1/nipplejs.min.js"></script>
     <style>
+        :root {
+            --xbox-green: #107C10;
+            --xbox-red: #E81123;
+            --xbox-blue: #0078D7;
+            --xbox-yellow: #F2C811;
+            --bg-glass: rgba(255, 255, 255, 0.15);
+            --active-glass: rgba(255, 255, 255, 0.4);
+        }
+
         body {
-            background-color: #121212;
-            color: white;
-            font-family: sans-serif;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
             margin: 0;
-            padding: 20px;
-        }
-        canvas {
-            background-color: black;
-            width: 100%;
-            max-width: 1280px;
-            aspect-ratio: 16/9;
-            border: 2px solid #333;
-            border-radius: 8px;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
-        }
-        .controls {
-            margin-top: 20px;
-            display: flex;
-            gap: 15px;
-        }
-        button {
-            padding: 10px 20px;
-            font-size: 16px;
-            cursor: pointer;
-            border-radius: 5px;
-            border: none;
-            background-color: #007bff;
+            padding: 0;
+            width: 100vw;
+            height: 100vh;
+            background: #121212;
             color: white;
-            font-weight: bold;
+            font-family: 'Segoe UI', sans-serif;
+            overflow: hidden;
+            touch-action: none;
+            user-select: none;
         }
-        button:hover { background-color: #0056b3; }
-        #status { margin-bottom: 10px; color: #aaa; }
+
+        /* WebCodecs Canvas Background */
+        #video-canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: black;
+            object-fit: contain; /* Keeps 16:9 aspect ratio correctly scaled */
+            z-index: 1; /* Behind UI */
+        }
+
+        /* UI Container */
+        .container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            display: flex;
+            width: 100vw;
+            height: 100vh;
+            z-index: 10;
+        }
+
+        #left-zone, #right-zone {
+            flex: 1;
+            height: 100%;
+            position: relative;
+        }
+
+        #left-stick-zone {
+            position: absolute;
+            left: calc(25% - 80px);
+            bottom: calc(20% - 80px);
+            width: 160px;
+            height: 160px;
+        }
+
+        #right-stick-zone {
+            position: absolute;
+            left: calc(25% - 70px);
+            bottom: calc(20% - 70px);
+            width: 140px;
+            height: 140px;
+        }
+
+        .btn {
+            background: var(--bg-glass);
+            border: 2px solid rgba(255, 255, 255, 0.2);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 1.2rem;
+            transition: transform 0.05s, background 0.1s;
+            position: absolute;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+            z-index: 10;
+        }
+
+        .abxy-container {
+            position: absolute;
+            bottom: 10%;
+            right: 10%;
+            width: 170px;
+            height: 170px;
+            pointer-events: none;
+        }
+
+        .btn-action { width: 55px; height: 55px; pointer-events: auto; }
+        .btn-y { top: 0; left: 50%; transform: translateX(-50%); border-color: var(--xbox-yellow); color: var(--xbox-yellow); text-shadow: 0 0 5px rgba(0,0,0,0.8); }
+        .btn-a { bottom: 0; left: 50%; transform: translateX(-50%); border-color: var(--xbox-green); color: var(--xbox-green); text-shadow: 0 0 5px rgba(0,0,0,0.8); }
+        .btn-x { left: 0; top: 50%; transform: translateY(-50%); border-color: var(--xbox-blue); color: var(--xbox-blue); text-shadow: 0 0 5px rgba(0,0,0,0.8); }
+        .btn-b { right: 0; top: 50%; transform: translateY(-50%); border-color: var(--xbox-red); color: var(--xbox-red); text-shadow: 0 0 5px rgba(0,0,0,0.8); }
+
+        #debug {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            pointer-events: none;
+            background: rgba(0,0,0,0.6);
+            padding: 10px;
+            border-radius: 5px;
+            font-size: 0.7rem;
+            font-family: monospace;
+            z-index: 100;
+            max-width: 300px;
+        }
     </style>
 </head>
 <body>
 
-    <h2>Low-Latency Desktop Stream (WebCodecs API)</h2>
-    <div id="status">Status: Disconnected</div>
     
-    <!-- Replaced <video> with <canvas> for WebCodecs rendering -->
-    <canvas id="video-canvas" width="1920" height="1080"></canvas>
-
-    <div class="controls">
-        <button id="btn-a">Press 'A' Button</button>
-        <button id="btn-b">Press 'B' Button</button>
+    <div id="debug">Initializing...</div>
+    
+    <div class="container" id="container">
+        <div id="left-zone">
+            <div id="left-stick-zone"></div>
+        </div>
+        
+        <div id="right-zone">
+            <div id="right-stick-zone"></div>
+            <div class="abxy-container">
+                <div class="btn btn-action btn-y" data-btn="Y">Y</div>
+                <div class="btn btn-action btn-b" data-btn="B">B</div>
+                <div class="btn btn-action btn-a" data-btn="A">A</div>
+                <div class="btn btn-action btn-x" data-btn="X">X</div>
+            </div>
+        </div>
     </div>
-
+    
+    <canvas id="video-canvas" width="1920" height="1080"></canvas>
     <script>
+        // --- 1. UI & State Setup ---
+        const debugElement = document.getElementById('debug');
         const canvas = document.getElementById('video-canvas');
         const ctx = canvas.getContext('2d', { alpha: false }); // alpha: false heavily optimizes rendering
-        const statusElement = document.getElementById('status');
         
-        let pc;
-        let ws;
-        let inputChannel;
+        let packetCount = 0;
+        let dataChannel;
+        let decoderStatus = "Initializing";
 
-        // 1. Setup the GPU Hardware Decoder (WebCodecs)
+        const state = {
+            lx: 0, ly: 0,
+            dx: 0, dy: 0,
+            buttons: 0,
+        };
+
+        function updateDebug() {
+            debugElement.innerHTML = `
+        WebSocket: ${socket.readyState === 1 ? 'Connected' : 'Disconnected'}<br>
+        DataChannel: ${dataChannel?.readyState || 'Not Connected'}<br>
+        Decoder: ${decoderStatus}<br>
+        Packets: ${packetCount}<br>
+        LStick: ${state.lx}, ${state.ly}<br>
+        RStick: ${state.dx}, ${state.dy}<br>
+        Buttons: 0x${state.buttons.toString(16).padStart(2, '0')}<br>
+        Touches: ${touchSlots.filter(x => x !== null).length}/5
+            `.trim();
+        }
+
+        // --- 2. WebCodecs Hardware Decoder Setup ---
         const decoder = new VideoDecoder({
             output(frame) {
                 // Instantly paint the decoded frame to the canvas
@@ -74,97 +178,86 @@
             },
             error(e) {
                 console.error("WebCodecs Decoder Error:", e);
-                statusElement.innerText = "Status: Decoder Error - Check Console";
+                decoderStatus = "Error - Check Console";
             }
         });
 
-        // Configure the decoder for 1080p Baseline Profile (Level 4.2) ( 1080p)
         decoder.configure({
-            codec: 'avc1.42E02A', 
+            codec: 'avc1.42E02A', // 1080p Baseline Profile
             hardwareAcceleration: 'prefer-hardware'
         });
 
-        ws = new WebSocket('ws://192.168.1.105:8080');
+        // --- 3. WebRTC & Signaling Setup ---
+        const socket = new WebSocket('ws://192.168.1.105:8080'); // Adjust IP if needed
 
-        ws.onopen = () => {
-            statusElement.innerText = "Status: Connected to Signaling Server. Waiting for Offer...";
-            
-            // 2. Enable encodedInsertableStreams in WebRTC config
-            pc = new RTCPeerConnection({
-                iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-                encodedInsertableStreams: true 
-            });
+        const pc = new RTCPeerConnection({
+            iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+            encodedInsertableStreams: true // Enables WebCodecs interception
+        });
 
-            // Handle incoming video track automatically
-            pc.ontrack = (event) => {
-                console.log("Track received!", event.track);
-                if (event.track.kind === 'video') {
-                    statusElement.innerText = "Status: Hardware Decoding via WebCodecs";
-
-                    // 3. Intercept the raw network stream
-                    const receiver = event.receiver;
-                    const { readable } = receiver.createEncodedStreams();
-                    const reader = readable.getReader();
-
-                    // 4. Feed the raw network packets directly into the GPU
-                    async function processNetworkStream() {
-                        while (true) {
-                            const { done, value } = await reader.read();
-                            if (done) break;
-
-                            const chunk = new EncodedVideoChunk({
-                                type: value.type, // 'key' or 'delta'
-                                timestamp: value.timestamp,
-                                data: value.data
-                            });
-
-                            decoder.decode(chunk);
-                        }
-                    }
-
-                    processNetworkStream();
-                }
+        // Handle Data Channel dynamically via signaling
+        pc.ondatachannel = (event) => {
+            dataChannel = event.channel;
+            dataChannel.onopen = () => {
+                console.log('[RTC] DataChannel opened');
+                updateDebug();
             };
+            dataChannel.onerror = (err) => console.error('[RTC] DataChannel error:', err);
+            dataChannel.onclose = () => console.log('[RTC] DataChannel closed');
+        };
 
-            // Handle outgoing ICE candidates
+        // Handle incoming video track automatically
+        pc.ontrack = (event) => {
+            console.log("Track received!", event.track);
+            if (event.track.kind === 'video') {
+                decoderStatus = "Hardware Decoding Active";
+                
+                const receiver = event.receiver;
+                const { readable } = receiver.createEncodedStreams();
+                const reader = readable.getReader();
+
+                // Feed the raw network packets directly into the GPU
+                async function processNetworkStream() {
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+
+                        const chunk = new EncodedVideoChunk({
+                            type: value.type, // 'key' or 'delta'
+                            timestamp: value.timestamp,
+                            data: value.data
+                        });
+                        decoder.decode(chunk);
+                    }
+                }
+                processNetworkStream();
+            }
+        };
+
+        socket.onopen = () => {
+            console.log('[WS] Connected to signaling server');
             pc.onicecandidate = (event) => {
                 if (event.candidate) {
-                    ws.send(JSON.stringify({
+                    socket.send(JSON.stringify({
                         candidate: event.candidate.candidate,
                         mid: event.candidate.sdpMid
                     }));
                 }
             };
-
-            // Handle the Data Channel automatically when the server offers it
-            pc.ondatachannel = (event) => {
-                inputChannel = event.channel;
-                console.log("Data Channel received:", inputChannel.label);
-                
-                inputChannel.onopen = () => console.log("Data channel open!");
-                inputChannel.onmessage = (e) => console.log("Message from server:", e.data);
-            };
+            updateDebug();
         };
 
-        // Handle incoming messages from C++
-        ws.onmessage = async (event) => {
+        socket.onmessage = async (event) => {
             const msg = JSON.parse(event.data);
 
             if (msg.type === 'offer') {
-                // 1. Server sent an offer. Accept it.
+                console.log('[Signal] Received offer');
                 await pc.setRemoteDescription(new RTCSessionDescription(msg));
-                
-                // 2. Create an Answer to send back
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
-                
-                // 3. Send the answer to the C++ server
-                ws.send(JSON.stringify({
-                    type: answer.type,
-                    sdp: answer.sdp
-                }));
-            } else if (msg.candidate) {
-                // Add ICE candidates from the server
+                socket.send(JSON.stringify({ type: 'answer', sdp: pc.localDescription.sdp }));
+            } 
+            else if (msg.candidate) {
                 await pc.addIceCandidate(new RTCIceCandidate({
                     candidate: msg.candidate,
                     sdpMid: msg.mid
@@ -172,34 +265,198 @@
             }
         };
 
-        ws.onclose = () => {
-            statusElement.innerText = "Status: Disconnected";
+        socket.onclose = () => {
+            console.log('[WS] Disconnected');
+            updateDebug();
         };
 
-        // --- Input Simulation (Sending Binary Structs to C++) ---
-        function sendInputStruct(lx, ly, buttonA, buttonB) {
-            if (!inputChannel || inputChannel.readyState !== 'open') return;
+        // --- 4. Virtual Controller Logic (49-byte structs) ---
+        const touchSlots = new Array(5).fill(null);
+        const touchStates = Array.from({length: 5}, () => ({
+            x: 0, y: 0, id: 0, state: 0, pressure: 0,
+        }));
 
-            const buffer = new ArrayBuffer(5);
-            const view = new DataView(buffer);
+        const alloc = (id) => {
+            for (let i = 0; i < 5; i++) {
+                if (touchSlots[i] === null) { touchSlots[i] = id; return i; }
+            }
+            return -1;
+        };
+        const getSlot = (id) => touchSlots.indexOf(id);
+        const freeSlot = (id) => {
+            const i = touchSlots.indexOf(id);
+            if (i !== -1) touchSlots[i] = null;
+            return i;
+        };
 
-            view.setInt16(0, lx, true);
-            view.setInt16(2, ly, true);
-
-            let buttons = 0;
-            if (buttonA) buttons |= (1 << 0);
-            if (buttonB) buttons |= (1 << 1);
-            
-            view.setUint8(4, buttons);
-            inputChannel.send(buffer);
+        function sendInput(type, key, value) {
+            if (type === "axis" && key === "LeftStick") {
+                state.lx = Math.floor(value.x * 32767);
+                state.ly = Math.floor(value.y * 32767);
+            }
+            if (type === "axis" && key === "RightStick") {
+                state.dx = Math.floor(value.x * 32767);
+                state.dy = Math.floor(value.y * 32767);
+            }
+            if (type === "button") {
+                const map = { A: 0, B: 1, X: 2, Y: 3 };
+                const bit = map[key];
+                if (value) state.buttons |= (1 << bit);
+                else state.buttons &= ~(1 << bit);
+            }
+            sendPacket();
         }
 
-        document.getElementById('btn-a').addEventListener('mousedown', () => {
-            sendInputStruct(32767, 0, true, false); 
+        function sendPacket() {
+            if (!dataChannel || dataChannel.readyState !== 'open') return;
+
+            const buffer = new ArrayBuffer(49);
+            const view = new DataView(buffer);
+
+            // Joysticks (8 bytes)
+            view.setInt16(0, state.lx, true);
+            view.setInt16(2, state.ly, true);
+            view.setInt16(4, state.dx, true);
+            view.setInt16(6, state.dy, true);
+            
+            // TouchPoints array (40 bytes = 5 points × 8 bytes)
+            for (let i = 0; i < 5; i++) {
+                const tp = touchStates[i];
+                const o = 8 + i * 8;
+                view.setInt16(o,     Math.floor(tp.x * 32767), true); 
+                view.setInt16(o + 2, Math.floor(tp.y * 32767), true); 
+                view.setInt8 (o + 4, tp.id);                          
+                view.setInt8 (o + 5, tp.state);                       
+                view.setInt16(o + 6, Math.round((tp.pressure || 1.0) * 32767), true); 
+            }
+            
+            // Buttons (1 byte)
+            view.setUint8(48, state.buttons);
+
+            try {
+                dataChannel.send(buffer);
+                packetCount++;
+            } catch (err) {
+                console.error('[Send] Error:', err);
+            }
+        }
+
+        // --- 5. UI Event Listeners ---
+        // Buttons
+        document.querySelectorAll('.btn').forEach(btn => {
+            const buttonName = btn.getAttribute('data-btn');
+            btn.addEventListener('touchstart', (e) => {
+                e.preventDefault();
+                if (navigator.vibrate) navigator.vibrate(15);
+                sendInput('button', buttonName, 1);
+                btn.style.background = 'var(--active-glass)';
+            });
+            btn.addEventListener('touchend', (e) => {
+                e.preventDefault();
+                sendInput('button', buttonName, 0);
+                btn.style.background = 'var(--bg-glass)';
+            });
         });
-        document.getElementById('btn-b').addEventListener('mousedown', () => {
-            sendInputStruct(0, -32767, false, true); 
+
+        // Joysticks
+        const leftStick = nipplejs.create({
+            zone: document.getElementById('left-stick-zone'),
+            mode: 'static',
+            position: { left: '50%', bottom: '50%' },
+            color: 'rgba(255,255,255,0.5)',
+            size: 130
         });
+
+        leftStick.on('move', (evt, data) => {
+            const x = Math.cos(data.angle.radian) * (data.distance / 65);
+            const y = Math.sin(data.angle.radian) * (data.distance / 65);
+            sendInput('axis', 'LeftStick', { x, y });
+        });
+        leftStick.on('end', () => sendInput('axis', 'LeftStick', { x: 0, y: 0 }));
+
+        const rightStick = nipplejs.create({
+            zone: document.getElementById('right-stick-zone'),
+            mode: 'semi',
+            catchDistance: 200,
+            color: 'rgba(255,255,255,0.5)',
+            size: 110
+        });
+
+        rightStick.on('move', (evt, data) => {
+            const x = Math.cos(data.angle.radian) * (data.distance / 55);
+            const y = Math.sin(data.angle.radian) * (data.distance / 55);
+            sendInput('axis', 'RightStick', { x, y });
+        });
+        rightStick.on('end', () => sendInput('axis', 'RightStick', { x: 0, y: 0 }));
+
+        // Stop joystick touches from bubbling down to screen touches
+        ['left-stick-zone', 'right-stick-zone'].forEach(id => {
+            const el = document.getElementById(id);
+            el.addEventListener('touchstart', e => e.stopPropagation(), { passive: true });
+            el.addEventListener('touchmove', e => e.stopPropagation(), { passive: true });
+            el.addEventListener('touchend', e => e.stopPropagation(), { passive: true });
+        });
+
+        // Multi-touch overlay handling
+        const container = document.getElementById("container");
+        
+        container.addEventListener('touchstart', (e) => {
+            for (const t of e.changedTouches) {
+                const slot = alloc(t.identifier);
+                if (slot === -1) continue;
+                touchStates[slot] = { 
+                    x: t.clientX / window.innerWidth, 
+                    y: t.clientY / window.innerHeight, 
+                    id: slot, 
+                    state: 1,
+                    pressure: t.force || 1.0
+                };
+            }
+            sendPacket();
+        }, { passive: true });
+        
+        container.addEventListener('touchmove', (e) => {
+            for (const t of e.changedTouches) {
+                const slot = getSlot(t.identifier);
+                if (slot === -1) continue;
+                touchStates[slot] = { 
+                    ...touchStates[slot],
+                    x: t.clientX / window.innerWidth, 
+                    y: t.clientY / window.innerHeight, 
+                    state: 1,
+                    pressure: t.force || touchStates[slot].pressure
+                };
+            }
+            sendPacket();
+        }, { passive: true });
+        
+        container.addEventListener('touchend', (e) => {
+            for (const t of e.changedTouches) {
+                const slot = freeSlot(t.identifier);
+                if (slot === -1) continue;
+                touchStates[slot] = { 
+                    ...touchStates[slot], 
+                    id: slot, 
+                    state: 2 
+                };
+            }
+            sendPacket();
+            
+            // Clear ended touches
+            setTimeout(() => {
+                for (let i = 0; i < 5; i++) {
+                    if (touchStates[i].state === 2) {
+                        touchStates[i] = { x: 0, y: 0, id: 0, state: 0, pressure: 0 };
+                    }
+                }
+            }, 50);
+        }, { passive: true });
+
+        window.oncontextmenu = (e) => e.preventDefault();
+        
+        // UI Updater
+        updateDebug();
+        setInterval(updateDebug, 1000);
     </script>
 </body>
 </html>
