@@ -120,7 +120,6 @@
 </head>
 <body>
 
-    
     <div id="debug">Initializing...</div>
     
     <div class="container" id="container">
@@ -170,21 +169,34 @@
         }
 
         // --- 2. WebCodecs Hardware Decoder Setup ---
+        let pendingFrame = null;
         const decoder = new VideoDecoder({
             output(frame) {
-                // Instantly paint the decoded frame to the canvas
-                ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
-                frame.close(); // CRITICAL: Free GPU memory
+                if (pendingFrame) {
+                    pendingFrame.close();
+                }
+                pendingFrame = frame;
+
+                // Tell the browser to draw this exactly when the screen is ready to refresh
+                requestAnimationFrame(() => {
+                    if (pendingFrame) {
+                        ctx.drawImage(pendingFrame, 0, 0, canvas.width, canvas.height);
+                        pendingFrame.close(); // CRITICAL: Free GPU memory AFTER drawing
+                        pendingFrame = null;
+                    }
+                });
             },
             error(e) {
                 console.error("WebCodecs Decoder Error:", e);
-                decoderStatus = "Error - Check Console";
+                packetCount = "Error - Check Console";
+                updateDebug();
             }
         });
 
         decoder.configure({
             codec: 'avc1.42E02A', // 1080p Baseline Profile
-            hardwareAcceleration: 'prefer-hardware'
+            hardwareAcceleration: 'prefer-hardware',
+            optimizeForLatency: true
         });
 
         // --- 3. WebRTC & Signaling Setup ---
@@ -216,18 +228,39 @@
                 const { readable } = receiver.createEncodedStreams();
                 const reader = readable.getReader();
 
+                let totalFramesReceived = 0;
+                let droppedFrames = 0;
+
                 // Feed the raw network packets directly into the GPU
                 async function processNetworkStream() {
                     while (true) {
                         const { done, value } = await reader.read();
                         if (done) break;
 
+                        totalFramesReceived++;
+                        
+                        // Update status string (actual DOM update happens in setInterval)
+                        decoderStatus = `Decoding | Frames: ${totalFramesReceived} | Dropped: ${droppedFrames}`;
+
+                        // --- ANTI-FREEZE PROTECTION FOR MOBILE ---
+                        // If the phone's GPU queue is backing up, drop the frame
+                        if (decoder.decodeQueueSize > 5) {
+                            droppedFrames++;
+                            console.warn(`Phone is choking! Queue size: ${decoder.decodeQueueSize}. Dropping frame.`);
+                            continue; // Skip decode completely
+                        }
+
                         const chunk = new EncodedVideoChunk({
                             type: value.type, // 'key' or 'delta'
                             timestamp: value.timestamp,
                             data: value.data
                         });
-                        decoder.decode(chunk);
+                        
+                        try {
+                            decoder.decode(chunk);
+                        } catch (err) {
+                            decoderStatus = "Decode Error: " + err.message;
+                        }
                     }
                 }
                 processNetworkStream();
@@ -454,7 +487,7 @@
 
         window.oncontextmenu = (e) => e.preventDefault();
         
-        // UI Updater
+        // UI Updater (Only running once per second to prevent UI thread blocking)
         updateDebug();
         setInterval(updateDebug, 1000);
     </script>
