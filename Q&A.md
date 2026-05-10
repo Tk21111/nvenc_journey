@@ -12,3 +12,4 @@ When you run your program, Windows/Linux will automatically look in those system
 nvEncodeAPI.h (The Map): This is the header file. It tells the C++ compiler what the functions and data structures look like. You must #include this in your code so the compiler doesn't complain about "undefined" names.
 
 nvEncodeAPI.lib (The Bridge): This is an Import Library. It doesn't actually contain the code for encoding video. Instead, it tells the compiler: "Hey, when this program runs, look for nvEncodeAPI.dll to find these functions."
+

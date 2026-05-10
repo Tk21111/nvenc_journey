@@ -208,7 +208,7 @@ int main() {
     ComPtr<IDXGIAdapter> adapter;
     dxgiDevice->GetAdapter(&adapter);
     ComPtr<IDXGIOutput> output;
-    adapter->EnumOutputs(0, &output);
+    adapter->EnumOutputs(1, &output);
     ComPtr<IDXGIOutput1> output1;
     output.As(&output1);
     
