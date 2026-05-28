@@ -28,7 +28,6 @@
             user-select: none;
         }
 
-        /* WebCodecs Canvas Background */
         #video-canvas {
             position: absolute;
             top: 0;
@@ -36,11 +35,10 @@
             width: 100%;
             height: 100%;
             background-color: black;
-            object-fit: contain; /* Keeps 16:9 aspect ratio correctly scaled */
-            z-index: 1; /* Behind UI */
+            object-fit: contain; 
+            z-index: 1; 
         }
 
-        /* UI Container */
         .container {
             position: absolute;
             top: 0;
@@ -108,19 +106,21 @@
             top: 10px;
             left: 10px;
             pointer-events: none;
-            background: rgba(0,0,0,0.6);
-            padding: 10px;
+            background: rgba(0,0,0,0.75);
+            padding: 12px;
             border-radius: 5px;
-            font-size: 0.7rem;
+            font-size: 0.75rem;
             font-family: monospace;
             z-index: 100;
-            max-width: 300px;
+            max-width: 350px;
+            color: #00ff00; /* Hacker green for visibility */
+            line-height: 1.4;
         }
     </style>
 </head>
 <body>
 
-    <div id="debug">Initializing...</div>
+    <div id="debug">Initializing Resource Monitor...</div>
     
     <div class="container" id="container">
         <div id="left-zone">
@@ -128,7 +128,6 @@
         </div>
         
         <div id="right-zone">
-            <div id="right-stick-zone"></div>
             <div class="abxy-container">
                 <div class="btn btn-action btn-y" data-btn="Y">Y</div>
                 <div class="btn btn-action btn-b" data-btn="B">B</div>
@@ -140,31 +139,96 @@
     
     <canvas id="video-canvas" width="1920" height="1080"></canvas>
     <script>
+
+        let isSending = false;
+
+        // ENABLED THE LOOP HERE
+        function sendLoop() {
+            //sendPacket(); 
+            //requestAnimationFrame(sendLoop); 
+        }
+
         // --- 1. UI & State Setup ---
         const debugElement = document.getElementById('debug');
         const canvas = document.getElementById('video-canvas');
-        const ctx = canvas.getContext('2d', { alpha: false }); // alpha: false heavily optimizes rendering
+        const ctx = canvas.getContext('2d', { alpha: false }); 
         
         let packetCount = 0;
         let dataChannel;
         let decoderStatus = "Initializing";
 
-        const state = {
-            lx: 0, ly: 0,
-            dx: 0, dy: 0,
-            buttons: 0,
-        };
+        const state = { lx: 0, ly: 0, dx: 0, dy: 0, buttons: 0 };
+
+        // --- NEW: Resource Monitor State ---
+        let currentFps = 0;
+        let framesThisSecond = 0;
+        let lastFpsTime = performance.now();
+        
+        const rtcStats = { bitrate: "0.00", packetLoss: 0, framesDropped: 0 };
+        let lastBytesReceived = 0;
+        let lastStatTime = performance.now();
+
+        // Measure true FPS
+        function measureFPS() {
+            framesThisSecond++;
+            const now = performance.now();
+            if (now - lastFpsTime >= 1000) {
+                currentFps = framesThisSecond;
+                framesThisSecond = 0;
+                lastFpsTime = now;
+            }
+            requestAnimationFrame(measureFPS);
+        }
+        requestAnimationFrame(measureFPS);
+
+        // Fetch WebRTC Data
+        async function fetchRTCStats() {
+            if (!pc) return;
+            try {
+                const stats = await pc.getStats();
+                stats.forEach(report => {
+                    if (report.type === 'inbound-rtp' && report.kind === 'video') {
+                        const now = performance.now();
+                        const bytes = report.bytesReceived;
+                        
+                        // Calculate Bitrate (Mbps)
+                        if (lastBytesReceived > 0) {
+                            const bitRateBps = (8 * (bytes - lastBytesReceived)) / ((now - lastStatTime) / 1000);
+                            rtcStats.bitrate = (bitRateBps / 1000000).toFixed(2);
+                        }
+                        
+                        lastBytesReceived = bytes;
+                        lastStatTime = now;
+                        
+                        rtcStats.packetLoss = report.packetsLost || 0;
+                        rtcStats.framesDropped = report.framesDropped || 0;
+                    }
+                });
+            } catch (err) {
+                console.warn("Could not fetch RTC stats");
+            }
+        }
 
         function updateDebug() {
+            // Calculate Memory
+            let memStr = "N/A";
+            if (performance.memory) {
+                memStr = Math.round(performance.memory.usedJSHeapSize / 1024 / 1024) + " MB";
+            }
+
             debugElement.innerHTML = `
-        WebSocket: ${socket.readyState === 1 ? 'Connected' : 'Disconnected'}<br>
-        DataChannel: ${dataChannel?.readyState || 'Not Connected'}<br>
-        Decoder: ${decoderStatus}<br>
-        Packets: ${packetCount}<br>
-        LStick: ${state.lx}, ${state.ly}<br>
-        RStick: ${state.dx}, ${state.dy}<br>
-        Buttons: 0x${state.buttons.toString(16).padStart(2, '0')}<br>
-        Touches: ${touchSlots.filter(x => x !== null).length}/5
+        === SYSTEM ===<br>
+        FPS: ${currentFps} | RAM: ${memStr}<br>
+        Dec: ${decoderStatus}<br>
+        === NETWORK ===<br>
+        WS:  ${socket.readyState === 1 ? 'Connected' : 'Disconnected'} | RTC: ${pc?.connectionState || 'N/A'}<br>
+        Spd: ${rtcStats.bitrate} Mbps<br>
+        Err: ${rtcStats.packetLoss} Pkt Loss | ${rtcStats.framesDropped} Frame Drop<br>
+        === INPUTS ===<br>
+        Out: ${packetCount} pkts | Tchs: ${touchSlots.filter(x => x !== null).length}/5<br>
+        LS:  ${state.lx}, ${state.ly}<br>
+        RS:  ${state.dx}, ${state.dy}<br>
+        Btn: 0x${state.buttons.toString(16).padStart(2, '0')}
             `.trim();
         }
 
@@ -177,19 +241,17 @@
                 }
                 pendingFrame = frame;
 
-                // Tell the browser to draw this exactly when the screen is ready to refresh
                 requestAnimationFrame(() => {
                     if (pendingFrame) {
                         ctx.drawImage(pendingFrame, 0, 0, canvas.width, canvas.height);
-                        pendingFrame.close(); // CRITICAL: Free GPU memory AFTER drawing
+                        pendingFrame.close(); 
                         pendingFrame = null;
                     }
                 });
             },
             error(e) {
                 console.error("WebCodecs Decoder Error:", e);
-                packetCount = "Error - Check Console";
-                updateDebug();
+                decoderStatus = "Error - Check Console";
             }
         });
 
@@ -200,27 +262,30 @@
         });
 
         // --- 3. WebRTC & Signaling Setup ---
-        const socket = new WebSocket('ws://192.168.1.105:8080'); // Adjust IP if needed
+        const socket = new WebSocket('ws://192.168.1.135:8081'); 
 
         const pc = new RTCPeerConnection({
             iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-            encodedInsertableStreams: true // Enables WebCodecs interception
+            encodedInsertableStreams: true 
         });
 
-        // Handle Data Channel dynamically via signaling
         pc.ondatachannel = (event) => {
             dataChannel = event.channel;
             dataChannel.onopen = () => {
                 console.log('[RTC] DataChannel opened');
-                updateDebug();
+                if (!isSending) {
+                    isSending = true;
+                    sendLoop(); // START LOOP HERE
+                }
             };
             dataChannel.onerror = (err) => console.error('[RTC] DataChannel error:', err);
-            dataChannel.onclose = () => console.log('[RTC] DataChannel closed');
+            dataChannel.onclose = () => {
+                console.log('[RTC] DataChannel closed');
+                isSending = false;
+            };
         };
 
-        // Handle incoming video track automatically
         pc.ontrack = (event) => {
-            console.log("Track received!", event.track);
             if (event.track.kind === 'video') {
                 decoderStatus = "Hardware Decoding Active";
                 
@@ -229,29 +294,23 @@
                 const reader = readable.getReader();
 
                 let totalFramesReceived = 0;
-                let droppedFrames = 0;
+                let localDroppedFrames = 0;
 
-                // Feed the raw network packets directly into the GPU
                 async function processNetworkStream() {
                     while (true) {
                         const { done, value } = await reader.read();
                         if (done) break;
 
                         totalFramesReceived++;
-                        
-                        // Update status string (actual DOM update happens in setInterval)
-                        decoderStatus = `Decoding | Frames: ${totalFramesReceived} | Dropped: ${droppedFrames}`;
+                        decoderStatus = `Decoding (${totalFramesReceived}) | Q-Drop: ${localDroppedFrames}`;
 
-                        // --- ANTI-FREEZE PROTECTION FOR MOBILE ---
-                        // If the phone's GPU queue is backing up, drop the frame
                         if (decoder.decodeQueueSize > 5) {
-                            droppedFrames++;
-                            console.warn(`Phone is choking! Queue size: ${decoder.decodeQueueSize}. Dropping frame.`);
-                            continue; // Skip decode completely
+                            localDroppedFrames++;
+                            continue; 
                         }
 
                         const chunk = new EncodedVideoChunk({
-                            type: value.type, // 'key' or 'delta'
+                            type: value.type,
                             timestamp: value.timestamp,
                             data: value.data
                         });
@@ -268,7 +327,6 @@
         };
 
         socket.onopen = () => {
-            console.log('[WS] Connected to signaling server');
             pc.onicecandidate = (event) => {
                 if (event.candidate) {
                     socket.send(JSON.stringify({
@@ -277,14 +335,11 @@
                     }));
                 }
             };
-            updateDebug();
         };
 
         socket.onmessage = async (event) => {
             const msg = JSON.parse(event.data);
-
             if (msg.type === 'offer') {
-                console.log('[Signal] Received offer');
                 await pc.setRemoteDescription(new RTCSessionDescription(msg));
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
@@ -296,11 +351,6 @@
                     sdpMid: msg.mid
                 }));
             }
-        };
-
-        socket.onclose = () => {
-            console.log('[WS] Disconnected');
-            updateDebug();
         };
 
         // --- 4. Virtual Controller Logic (49-byte structs) ---
@@ -346,13 +396,11 @@
             const buffer = new ArrayBuffer(49);
             const view = new DataView(buffer);
 
-            // Joysticks (8 bytes)
             view.setInt16(0, state.lx, true);
             view.setInt16(2, state.ly, true);
             view.setInt16(4, state.dx, true);
             view.setInt16(6, state.dy, true);
             
-            // TouchPoints array (40 bytes = 5 points × 8 bytes)
             for (let i = 0; i < 5; i++) {
                 const tp = touchStates[i];
                 const o = 8 + i * 8;
@@ -363,7 +411,6 @@
                 view.setInt16(o + 6, Math.round((tp.pressure || 1.0) * 32767), true); 
             }
             
-            // Buttons (1 byte)
             view.setUint8(48, state.buttons);
 
             try {
@@ -375,7 +422,6 @@
         }
 
         // --- 5. UI Event Listeners ---
-        // Buttons
         document.querySelectorAll('.btn').forEach(btn => {
             const buttonName = btn.getAttribute('data-btn');
             btn.addEventListener('touchstart', (e) => {
@@ -391,7 +437,6 @@
             });
         });
 
-        // Joysticks
         const leftStick = nipplejs.create({
             zone: document.getElementById('left-stick-zone'),
             mode: 'static',
@@ -399,7 +444,6 @@
             color: 'rgba(255,255,255,0.5)',
             size: 130
         });
-
         leftStick.on('move', (evt, data) => {
             const x = Math.cos(data.angle.radian) * (data.distance / 65);
             const y = Math.sin(data.angle.radian) * (data.distance / 65);
@@ -407,57 +451,47 @@
         });
         leftStick.on('end', () => sendInput('axis', 'LeftStick', { x: 0, y: 0 }));
 
-        const rightStick = nipplejs.create({
-            zone: document.getElementById('right-stick-zone'),
-            mode: 'semi',
-            catchDistance: 200,
-            color: 'rgba(255,255,255,0.5)',
-            size: 110
-        });
-
-        rightStick.on('move', (evt, data) => {
-            const x = Math.cos(data.angle.radian) * (data.distance / 55);
-            const y = Math.sin(data.angle.radian) * (data.distance / 55);
-            sendInput('axis', 'RightStick', { x, y });
-        });
-        rightStick.on('end', () => sendInput('axis', 'RightStick', { x: 0, y: 0 }));
-
-        // Stop joystick touches from bubbling down to screen touches
-        ['left-stick-zone', 'right-stick-zone'].forEach(id => {
+        ['left-stick-zone'].forEach(id => {
             const el = document.getElementById(id);
             el.addEventListener('touchstart', e => e.stopPropagation(), { passive: true });
             el.addEventListener('touchmove', e => e.stopPropagation(), { passive: true });
             el.addEventListener('touchend', e => e.stopPropagation(), { passive: true });
         });
 
-        // Multi-touch overlay handling
         const container = document.getElementById("container");
-        
         container.addEventListener('touchstart', (e) => {
             for (const t of e.changedTouches) {
                 const slot = alloc(t.identifier);
                 if (slot === -1) continue;
-                touchStates[slot] = { 
-                    x: t.clientX / window.innerWidth, 
-                    y: t.clientY / window.innerHeight, 
-                    id: slot, 
-                    state: 1,
-                    pressure: t.force || 1.0
-                };
+                touchStates[slot] = { x: t.clientX / window.innerWidth, y: t.clientY / window.innerHeight, id: slot, state: 1, pressure: t.force || 1.0 };
             }
             sendPacket();
         }, { passive: true });
         
+        const SMOOTHING = 0.15;
         container.addEventListener('touchmove', (e) => {
             for (const t of e.changedTouches) {
                 const slot = getSlot(t.identifier);
                 if (slot === -1) continue;
+
+                const prev = touchStates[slot];
+                const rawX = t.clientX / window.innerWidth;
+                const rawY = t.clientY / window.innerHeight;
+
+                let newX = rawX;
+                let newY = rawY;
+
+                if (prev && prev.state === 1) { 
+                    newX = prev.x + (rawX - prev.x) * SMOOTHING;
+                    newY = prev.y + (rawY - prev.y) * SMOOTHING;
+                }
+
                 touchStates[slot] = { 
-                    ...touchStates[slot],
-                    x: t.clientX / window.innerWidth, 
-                    y: t.clientY / window.innerHeight, 
-                    state: 1,
-                    pressure: t.force || touchStates[slot].pressure
+                    ...prev, 
+                    x: newX, 
+                    y: newY, 
+                    state: 1, 
+                    pressure: t.force || prev.pressure 
                 };
             }
             sendPacket();
@@ -467,15 +501,9 @@
             for (const t of e.changedTouches) {
                 const slot = freeSlot(t.identifier);
                 if (slot === -1) continue;
-                touchStates[slot] = { 
-                    ...touchStates[slot], 
-                    id: slot, 
-                    state: 2 
-                };
+                touchStates[slot] = { ...touchStates[slot], id: slot, state: 2 };
             }
             sendPacket();
-            
-            // Clear ended touches
             setTimeout(() => {
                 for (let i = 0; i < 5; i++) {
                     if (touchStates[i].state === 2) {
@@ -487,9 +515,12 @@
 
         window.oncontextmenu = (e) => e.preventDefault();
         
-        // UI Updater (Only running once per second to prevent UI thread blocking)
+        // Update dashboard every second
+        setInterval(async () => {
+            await fetchRTCStats();
+            updateDebug();
+        }, 1000);
         updateDebug();
-        setInterval(updateDebug, 1000);
     </script>
 </body>
 </html>

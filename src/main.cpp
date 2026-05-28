@@ -18,10 +18,14 @@
 #include "nvEncodeAPI.h"
 
 #include <mmsystem.h>
+#include <pdh.h>
+#include <pdhmsg.h>
+#include <fstream>
 
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "pdh.lib")
 
 
 using json = nlohmann::json;
@@ -44,6 +48,24 @@ map<shared_ptr<WebSocket>, Peer> peers;
 std::mutex peersMutex; // Protects the peers map from cross-thread crashes
 std::atomic<bool> forceIDR{false};
 
+// Resource Monitoring
+double peakCpu = 0;
+double peakGpu = 0;
+
+void BroadcastMetrics(double cpu, double gpu) {
+    json metrics = {
+        {"type", "metrics"},
+        {"cpu", cpu},
+        {"gpu", gpu}
+    };
+    string msg = metrics.dump();
+    std::lock_guard<std::mutex> lock(peersMutex);
+    for (auto const& [ws, peer] : peers) {
+        if (peer.dc && peer.dc->isOpen()) {
+            peer.dc->send(msg);
+        }
+    }
+}
 
 // Helper to broadcast H.264 NAL units to all connected WebRTC clients
 void BroadcastH264Frame(const void* h264Data, size_t sizeInBytes) {
@@ -57,6 +79,8 @@ void BroadcastH264Frame(const void* h264Data, size_t sizeInBytes) {
 }
 
 int main() {
+
+    try {
 
     timeBeginPeriod(1);
 
@@ -73,7 +97,7 @@ int main() {
     }
 
     WebSocketServer::Configuration wsConfig;
-    wsConfig.port = 8080;
+    wsConfig.port = 8081;
     auto wss = std::make_shared<WebSocketServer>(wsConfig);
 
     wss->onClient([&](shared_ptr<WebSocket> ws) {
@@ -192,6 +216,8 @@ int main() {
             std::lock_guard<std::mutex> lock(peersMutex);
             peers.erase(ws);
         });
+
+        
     });
 
     cout << "WebRTC Server listening on port 8080..." << endl;
@@ -208,7 +234,7 @@ int main() {
     ComPtr<IDXGIAdapter> adapter;
     dxgiDevice->GetAdapter(&adapter);
     ComPtr<IDXGIOutput> output;
-    adapter->EnumOutputs(1, &output);
+    adapter->EnumOutputs(0, &output);
     ComPtr<IDXGIOutput1> output1;
     output.As(&output1);
     
@@ -392,5 +418,14 @@ int main() {
     nv.nvEncDestroyBitstreamBuffer(hEncoder, cb.bitstreamBuffer);
     nv.nvEncDestroyEncoder(hEncoder);
 
+    } catch (const std::exception& e) {
+        std::cerr << "\n[FATAL ERROR] Caught exception: " << e.what() << std::endl;
+        system("pause"); // Keeps the console open so you can read it
+        return -1;
+    } catch (...) {
+        std::cerr << "\n[FATAL ERROR] Caught an unknown exception!" << std::endl;
+        system("pause");
+        return -1;
+    }
     return 0;
 }
