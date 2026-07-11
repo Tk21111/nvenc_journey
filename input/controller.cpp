@@ -37,18 +37,28 @@ void Controller::Update(const InputPacket& p)
 
     m_report.sThumbLX = p.lx;
     m_report.sThumbLY = p.ly;
-    m_report.sThumbRX = p.dx; 
-    m_report.sThumbRY = p.dy; 
+    m_report.sThumbRX = p.dx;
+    m_report.sThumbRY = p.dy;
+
+    m_report.bLeftTrigger  = p.lt;
+    m_report.bRightTrigger = p.rt;
 
     m_report.wButtons = 0;
-    if (p.buttons & (1 << 0)) m_report.wButtons |= XUSB_GAMEPAD_A;
-    if (p.buttons & (1 << 1)) m_report.wButtons |= XUSB_GAMEPAD_B;
-    if (p.buttons & (1 << 2)) m_report.wButtons |= XUSB_GAMEPAD_X;
-    if (p.buttons & (1 << 3)) m_report.wButtons |= XUSB_GAMEPAD_Y;
-    if (p.buttons & (1 << 4)) m_report.wButtons |= XUSB_GAMEPAD_LEFT_SHOULDER;
-    if (p.buttons & (1 << 5)) m_report.wButtons |= XUSB_GAMEPAD_RIGHT_SHOULDER;
-    if (p.buttons & (1 << 6)) m_report.wButtons |= XUSB_GAMEPAD_START;
-    if (p.buttons & (1 << 7)) m_report.wButtons |= XUSB_GAMEPAD_BACK;
+    if (p.buttons & BTN_A)      m_report.wButtons |= XUSB_GAMEPAD_A;
+    if (p.buttons & BTN_B)      m_report.wButtons |= XUSB_GAMEPAD_B;
+    if (p.buttons & BTN_X)      m_report.wButtons |= XUSB_GAMEPAD_X;
+    if (p.buttons & BTN_Y)      m_report.wButtons |= XUSB_GAMEPAD_Y;
+    if (p.buttons & BTN_LB)     m_report.wButtons |= XUSB_GAMEPAD_LEFT_SHOULDER;
+    if (p.buttons & BTN_RB)     m_report.wButtons |= XUSB_GAMEPAD_RIGHT_SHOULDER;
+    if (p.buttons & BTN_START)  m_report.wButtons |= XUSB_GAMEPAD_START;
+    if (p.buttons & BTN_BACK)   m_report.wButtons |= XUSB_GAMEPAD_BACK;
+    if (p.buttons & BTN_DUP)    m_report.wButtons |= XUSB_GAMEPAD_DPAD_UP;
+    if (p.buttons & BTN_DDOWN)  m_report.wButtons |= XUSB_GAMEPAD_DPAD_DOWN;
+    if (p.buttons & BTN_DLEFT)  m_report.wButtons |= XUSB_GAMEPAD_DPAD_LEFT;
+    if (p.buttons & BTN_DRIGHT) m_report.wButtons |= XUSB_GAMEPAD_DPAD_RIGHT;
+    if (p.buttons & BTN_L3)     m_report.wButtons |= XUSB_GAMEPAD_LEFT_THUMB;
+    if (p.buttons & BTN_R3)     m_report.wButtons |= XUSB_GAMEPAD_RIGHT_THUMB;
+    if (p.buttons & BTN_GUIDE)  m_report.wButtons |= XUSB_GAMEPAD_GUIDE;
 
     vigem_target_x360_update(m_client, m_pad, m_report);
 }

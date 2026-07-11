@@ -109,25 +109,118 @@
             background: rgba(0,0,0,0.75);
             padding: 12px;
             border-radius: 5px;
-            font-size: 0.75rem;
+            font-size: 0.7rem;
             font-family: monospace;
             z-index: 100;
-            max-width: 350px;
+            max-width: 300px;
             color: #00ff00; /* Hacker green for visibility */
-            line-height: 1.4;
+            line-height: 1.35;
+        }
+        #debug.hidden { display: none; }
+
+        #debug-toggle {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            width: 34px; height: 34px;
+            z-index: 101;
+            background: var(--bg-glass);
+            border: 1px solid rgba(255,255,255,0.3);
+            border-radius: 6px;
+            color: #fff; font-size: 1rem;
+            display: flex; align-items: center; justify-content: center;
+        }
+
+        /* Pressed feedback for every touch control */
+        .btn.pressed { background: var(--active-glass); transform: scale(0.92); }
+
+        /* Shoulders (LB/RB) and triggers (LT/RT) along the top edge */
+        .btn-top {
+            width: 74px; height: 40px;
+            border-radius: 12px;
+            font-size: 0.95rem;
+            pointer-events: auto;
+        }
+        .btn-lt { top: 10px; left: 4%; border-color: rgba(255,255,255,0.4); }
+        .btn-lb { top: 56px; left: 4%; }
+        .btn-rt { top: 10px; right: 4%; border-color: rgba(255,255,255,0.4); }
+        .btn-rb { top: 56px; right: 4%; }
+
+        /* Center system buttons: View / Guide / Menu */
+        .btn-sys {
+            top: 12px;
+            width: 46px; height: 34px;
+            font-size: 0.9rem;
+            border-radius: 8px;
+            pointer-events: auto;
+        }
+        .btn-view  { left: calc(50% - 78px); }
+        .btn-guide { left: calc(50% - 23px); border-color: var(--xbox-green); color: var(--xbox-green); border-radius: 50%; width: 40px; height: 40px; }
+        .btn-menu  { left: calc(50% + 32px); }
+
+        /* D-pad (upper-left, above the left stick) */
+        .dpad {
+            position: absolute;
+            left: 4%;
+            bottom: 42%;
+            width: 150px;
+            height: 150px;
+            pointer-events: none;
+        }
+        .btn-dpad { width: 50px; height: 50px; border-radius: 10px; pointer-events: auto; font-size: 1.1rem; }
+        .d-up    { top: 0;   left: 50px; }
+        .d-down  { bottom: 0; left: 50px; }
+        .d-left  { left: 0;  top: 50px; }
+        .d-right { right: 0; top: 50px; }
+
+        /* Stick-click buttons (L3 / R3) */
+        .btn-stickclick { width: 46px; height: 46px; font-size: 0.8rem; }
+        .btn-l3 { left: 3%;  bottom: 20%; }
+        .btn-r3 { right: 3%; bottom: 20%; }
+
+        /* Right analog stick zone (mirror of the left) */
+        #right-stick-zone {
+            position: absolute;
+            right: calc(24% - 80px);
+            left: auto;
+            bottom: calc(20% - 80px);
+            width: 160px;
+            height: 160px;
         }
     </style>
 </head>
 <body>
 
-    <div id="debug">Initializing Resource Monitor...</div>
-    
+    <div id="debug" class="hidden">Initializing Resource Monitor...</div>
+    <div id="debug-toggle">≡</div>
+
     <div class="container" id="container">
+        <!-- Shoulders + triggers -->
+        <div class="btn btn-top btn-lt" data-trigger="LT">LT</div>
+        <div class="btn btn-top btn-lb" data-btn="LB">LB</div>
+        <div class="btn btn-top btn-rt" data-trigger="RT">RT</div>
+        <div class="btn btn-top btn-rb" data-btn="RB">RB</div>
+
+        <!-- System buttons -->
+        <div class="btn btn-sys btn-view"  data-btn="Back">&#9112;</div>
+        <div class="btn btn-sys btn-guide" data-btn="Guide">&#10062;</div>
+        <div class="btn btn-sys btn-menu"  data-btn="Start">&#9776;</div>
+
         <div id="left-zone">
+            <!-- D-pad -->
+            <div class="dpad">
+                <div class="btn btn-dpad d-up"    data-btn="Up">&#9650;</div>
+                <div class="btn btn-dpad d-down"  data-btn="Down">&#9660;</div>
+                <div class="btn btn-dpad d-left"  data-btn="Left">&#9664;</div>
+                <div class="btn btn-dpad d-right" data-btn="Right">&#9654;</div>
+            </div>
             <div id="left-stick-zone"></div>
+            <div class="btn btn-stickclick btn-l3" data-btn="L3">L3</div>
         </div>
-        
+
         <div id="right-zone">
+            <div id="right-stick-zone"></div>
+            <div class="btn btn-stickclick btn-r3" data-btn="R3">R3</div>
             <div class="abxy-container">
                 <div class="btn btn-action btn-y" data-btn="Y">Y</div>
                 <div class="btn btn-action btn-b" data-btn="B">B</div>
@@ -136,7 +229,7 @@
             </div>
         </div>
     </div>
-    
+
     <canvas id="video-canvas" width="1920" height="1080"></canvas>
     <script>
 
@@ -157,16 +250,45 @@
         let dataChannel;
         let decoderStatus = "Initializing";
 
-        const state = { lx: 0, ly: 0, dx: 0, dy: 0, buttons: 0 };
+        const state = { lx: 0, ly: 0, dx: 0, dy: 0, buttons: 0, lt: 0, rt: 0 };
+
+        // Button bit layout — MUST match protocol/packet.hpp
+        const BTN = {
+            A: 0, B: 1, X: 2, Y: 3, LB: 4, RB: 5, Start: 6, Back: 7,
+            Up: 8, Down: 9, Left: 10, Right: 11, L3: 12, R3: 13, Guide: 14,
+        };
 
         // --- NEW: Resource Monitor State ---
         let currentFps = 0;
         let framesThisSecond = 0;
         let lastFpsTime = performance.now();
         
-        const rtcStats = { bitrate: "0.00", packetLoss: 0, framesDropped: 0 };
-        let lastBytesReceived = 0;
-        let lastStatTime = performance.now();
+        // --- Telemetry / observation log state ---
+        // Per-second aggregates built from the server's per-frame records:
+        const tele = { frames: 0, idrs: 0, bytes: 0,
+                       encUsSum: 0, encUsMax: 0, pipeUsSum: 0, pipeUsMax: 0, dtUsMax: 0 };
+        // Per-second RATES derived from getStats() deltas (NOT cumulative counters):
+        const netRate = { lossPct: 0, recvMbps: 0, decFps: 0,
+                          pli: 0, nack: 0, fir: 0, jitterMs: 0, freezes: 0 };
+        let prevStats = null;       // previous getStats snapshot for delta math
+        let lastServerFrame = null; // most recent per-frame record from server
+        let lastRow = null;         // most recent 1s rollup (for the overlay)
+        const logRows = [];         // downloadable client-side log
+
+        function setupTelemetry(ch) {
+            ch.onopen = () => console.log('[RTC] telemetry channel open');
+            ch.onmessage = (e) => {
+                let r; try { r = JSON.parse(e.data); } catch { return; }
+                if (r.t !== 'f') return;
+                tele.frames++;
+                tele.bytes += r.bytes;
+                if (r.idr) tele.idrs++;
+                tele.encUsSum  += r.encUs;  tele.encUsMax  = Math.max(tele.encUsMax,  r.encUs);
+                tele.pipeUsSum += r.pipeUs; tele.pipeUsMax = Math.max(tele.pipeUsMax, r.pipeUs);
+                tele.dtUsMax = Math.max(tele.dtUsMax, r.dtUs);
+                lastServerFrame = r;
+            };
+        }
 
         // Measure true FPS
         function measureFPS() {
@@ -181,33 +303,98 @@
         }
         requestAnimationFrame(measureFPS);
 
-        // Fetch WebRTC Data
+        // Fetch WebRTC data and derive PER-SECOND rates (deltas), not raw counters.
         async function fetchRTCStats() {
             if (!pc) return;
             try {
                 const stats = await pc.getStats();
-                stats.forEach(report => {
-                    if (report.type === 'inbound-rtp' && report.kind === 'video') {
-                        const now = performance.now();
-                        const bytes = report.bytesReceived;
-                        
-                        // Calculate Bitrate (Mbps)
-                        if (lastBytesReceived > 0) {
-                            const bitRateBps = (8 * (bytes - lastBytesReceived)) / ((now - lastStatTime) / 1000);
-                            rtcStats.bitrate = (bitRateBps / 1000000).toFixed(2);
-                        }
-                        
-                        lastBytesReceived = bytes;
-                        lastStatTime = now;
-                        
-                        rtcStats.packetLoss = report.packetsLost || 0;
-                        rtcStats.framesDropped = report.framesDropped || 0;
-                    }
+                let inbound = null;
+                stats.forEach(rep => {
+                    if (rep.type === 'inbound-rtp' && rep.kind === 'video') inbound = rep;
                 });
+                if (!inbound) return;
+
+                const now = performance.now();
+                const cur = {
+                    t: now,
+                    packetsReceived: inbound.packetsReceived || 0,
+                    packetsLost: inbound.packetsLost || 0,
+                    bytesReceived: inbound.bytesReceived || 0,
+                    framesDecoded: inbound.framesDecoded || 0,
+                    pliCount: inbound.pliCount || 0,
+                    nackCount: inbound.nackCount || 0,
+                    firCount: inbound.firCount || 0,
+                    freezeCount: inbound.freezeCount || 0,
+                };
+
+                if (prevStats) {
+                    const dt = (now - prevStats.t) / 1000; // seconds
+                    const dRecv  = cur.packetsReceived - prevStats.packetsReceived;
+                    const dLost  = cur.packetsLost     - prevStats.packetsLost;
+                    const dBytes = cur.bytesReceived   - prevStats.bytesReceived;
+                    const dFrm   = cur.framesDecoded   - prevStats.framesDecoded;
+                    const denom  = dRecv + dLost;
+                    // THE number that actually matters: fraction of packets lost this second.
+                    netRate.lossPct  = denom > 0 ? (100 * dLost / denom) : 0;
+                    netRate.recvMbps = dt > 0 ? (8 * dBytes / dt) / 1e6 : 0;
+                    netRate.decFps   = dt > 0 ? dFrm / dt : 0;
+                    netRate.pli      = cur.pliCount  - prevStats.pliCount;
+                    netRate.nack     = cur.nackCount - prevStats.nackCount;
+                    netRate.fir      = cur.firCount  - prevStats.firCount;
+                    netRate.freezes  = cur.freezeCount - prevStats.freezeCount;
+                }
+                netRate.jitterMs = (inbound.jitter || 0) * 1000;
+                prevStats = cur;
             } catch (err) {
                 console.warn("Could not fetch RTC stats");
             }
         }
+
+        // Snapshot one second of telemetry into a log row, then reset accumulators.
+        function rollupSecond() {
+            const f = tele.frames || 1;
+            const row = {
+                sec:       (performance.now() / 1000).toFixed(1),
+                srvFps:    tele.frames,
+                idrPerS:   tele.idrs,
+                srvMbps:   (8 * tele.bytes / 1e6).toFixed(2),
+                encMsAvg:  (tele.encUsSum / f / 1000).toFixed(2),
+                encMsMax:  (tele.encUsMax / 1000).toFixed(2),
+                pipeMsAvg: (tele.pipeUsSum / f / 1000).toFixed(2),
+                pipeMsMax: (tele.pipeUsMax / 1000).toFixed(2),
+                dtMsMax:   (tele.dtUsMax / 1000).toFixed(2),
+                lossPct:   netRate.lossPct.toFixed(1),
+                recvMbps:  netRate.recvMbps.toFixed(2),
+                decFps:    Math.round(netRate.decFps),
+                pli:       netRate.pli,
+                nack:      netRate.nack,
+                fir:       netRate.fir,
+                jitterMs:  netRate.jitterMs.toFixed(1),
+                freezes:   netRate.freezes,
+            };
+            logRows.push(row);
+            if (logRows.length > 3600) logRows.shift(); // cap ~1 hour
+            lastRow = row;
+            tele.frames = 0; tele.idrs = 0; tele.bytes = 0;
+            tele.encUsSum = 0; tele.encUsMax = 0;
+            tele.pipeUsSum = 0; tele.pipeUsMax = 0; tele.dtUsMax = 0;
+        }
+
+        // Download the client-side observation log as CSV (also bound to the "L" key).
+        window.saveLog = () => {
+            if (!logRows.length) { console.warn('[telemetry] no rows yet'); return; }
+            const cols = Object.keys(logRows[0]);
+            const csv = [cols.join(',')]
+                .concat(logRows.map(r => cols.map(c => r[c]).join(',')))
+                .join('\n');
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+            a.download = 'client_telemetry.csv';
+            a.click();
+        };
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'l' || e.key === 'L') window.saveLog();
+        });
 
         function updateDebug() {
             // Calculate Memory
@@ -216,14 +403,21 @@
                 memStr = Math.round(performance.memory.usedJSHeapSize / 1024 / 1024) + " MB";
             }
 
+            const r = lastRow || {};
+            const loss = parseFloat(r.lossPct || 0);
+            const lossFlag = loss > 2 ? ' <<' : ''; // flag when loss is meaningful
             debugElement.innerHTML = `
         === SYSTEM ===<br>
         FPS: ${currentFps} | RAM: ${memStr}<br>
         Dec: ${decoderStatus}<br>
-        === NETWORK ===<br>
+        === NETWORK (per sec) ===<br>
         WS:  ${socket.readyState === 1 ? 'Connected' : 'Disconnected'} | RTC: ${pc?.connectionState || 'N/A'}<br>
-        Spd: ${rtcStats.bitrate} Mbps<br>
-        Err: ${rtcStats.packetLoss} Pkt Loss | ${rtcStats.framesDropped} Frame Drop<br>
+        Loss: ${r.lossPct ?? '-'}%${lossFlag} | Jit: ${r.jitterMs ?? '-'}ms | Frz: ${r.freezes ?? '-'}<br>
+        Recv: ${r.recvMbps ?? '-'} / Sent: ${r.srvMbps ?? '-'} Mbps<br>
+        PLI/s: ${r.pli ?? '-'} | NACK/s: ${r.nack ?? '-'} | Dec: ${r.decFps ?? '-'}fps<br>
+        === PIPELINE (server) ===<br>
+        Enc: ${r.encMsAvg ?? '-'}/${r.encMsMax ?? '-'}ms | Pipe: ${r.pipeMsAvg ?? '-'}/${r.pipeMsMax ?? '-'}ms<br>
+        SrvFps: ${r.srvFps ?? '-'} | IDR/s: ${r.idrPerS ?? '-'} | dtMax: ${r.dtMsMax ?? '-'}ms<br>
         === INPUTS ===<br>
         Out: ${packetCount} pkts | Tchs: ${touchSlots.filter(x => x !== null).length}/5<br>
         LS:  ${state.lx}, ${state.ly}<br>
@@ -270,7 +464,15 @@
         });
 
         pc.ondatachannel = (event) => {
-            dataChannel = event.channel;
+            const ch = event.channel;
+
+            // Route the observation-log channel separately from input.
+            if (ch.label === 'telemetry') {
+                setupTelemetry(ch);
+                return;
+            }
+
+            dataChannel = ch;
             dataChannel.onopen = () => {
                 console.log('[RTC] DataChannel opened');
                 if (!isSending) {
@@ -381,9 +583,14 @@
                 state.dx = Math.floor(value.x * 32767);
                 state.dy = Math.floor(value.y * 32767);
             }
+            if (type === "trigger") {
+                // key = "LT" | "RT"; digital press -> full pull
+                if (key === "LT") state.lt = value ? 255 : 0;
+                if (key === "RT") state.rt = value ? 255 : 0;
+            }
             if (type === "button") {
-                const map = { A: 0, B: 1, X: 2, Y: 3 };
-                const bit = map[key];
+                const bit = BTN[key];
+                if (bit === undefined) return;
                 if (value) state.buttons |= (1 << bit);
                 else state.buttons &= ~(1 << bit);
             }
@@ -393,25 +600,27 @@
         function sendPacket() {
             if (!dataChannel || dataChannel.readyState !== 'open') return;
 
-            const buffer = new ArrayBuffer(49);
+            const buffer = new ArrayBuffer(52);
             const view = new DataView(buffer);
 
             view.setInt16(0, state.lx, true);
             view.setInt16(2, state.ly, true);
             view.setInt16(4, state.dx, true);
             view.setInt16(6, state.dy, true);
-            
+
             for (let i = 0; i < 5; i++) {
                 const tp = touchStates[i];
                 const o = 8 + i * 8;
-                view.setInt16(o,     Math.floor(tp.x * 32767), true); 
-                view.setInt16(o + 2, Math.floor(tp.y * 32767), true); 
-                view.setInt8 (o + 4, tp.id);                          
-                view.setInt8 (o + 5, tp.state);                       
-                view.setInt16(o + 6, Math.round((tp.pressure || 1.0) * 32767), true); 
+                view.setInt16(o,     Math.floor(tp.x * 32767), true);
+                view.setInt16(o + 2, Math.floor(tp.y * 32767), true);
+                view.setInt8 (o + 4, tp.id);
+                view.setInt8 (o + 5, tp.state);
+                view.setInt16(o + 6, Math.round((tp.pressure || 1.0) * 32767), true);
             }
-            
-            view.setUint8(48, state.buttons);
+
+            view.setUint16(48, state.buttons, true); // 16-bit button mask
+            view.setUint8(50, state.lt);             // left trigger
+            view.setUint8(51, state.rt);             // right trigger
 
             try {
                 dataChannel.send(buffer);
@@ -422,41 +631,71 @@
         }
 
         // --- 5. UI Event Listeners ---
-        document.querySelectorAll('.btn').forEach(btn => {
-            const buttonName = btn.getAttribute('data-btn');
-            btn.addEventListener('touchstart', (e) => {
-                e.preventDefault();
+        // Pointer events unify touch/mouse and don't leak into the screen-touch layer.
+        function bindHoldButton(el) {
+            const btnName = el.getAttribute('data-btn');
+            const trigName = el.getAttribute('data-trigger');
+            const press = (v) => {
+                if (trigName) sendInput('trigger', trigName, v);
+                else if (btnName) sendInput('button', btnName, v);
+            };
+            let active = false;
+            const down = (e) => {
+                e.preventDefault(); e.stopPropagation();
+                if (active) return;
+                active = true;
+                try { el.setPointerCapture(e.pointerId); } catch (_) {}
                 if (navigator.vibrate) navigator.vibrate(15);
-                sendInput('button', buttonName, 1);
-                btn.style.background = 'var(--active-glass)';
-            });
-            btn.addEventListener('touchend', (e) => {
-                e.preventDefault();
-                sendInput('button', buttonName, 0);
-                btn.style.background = 'var(--bg-glass)';
-            });
+                el.classList.add('pressed');
+                press(1);
+            };
+            const up = (e) => {
+                if (!active) return;
+                active = false;
+                el.classList.remove('pressed');
+                press(0);
+            };
+            el.addEventListener('pointerdown', down);
+            el.addEventListener('pointerup', up);
+            el.addEventListener('pointercancel', up);
+            // Keep button taps out of the screen-touch layer (no phantom touch points).
+            el.addEventListener('touchstart', e => e.stopPropagation(), { passive: true });
+            el.addEventListener('touchend', e => e.stopPropagation(), { passive: true });
+        }
+        document.querySelectorAll('.btn[data-btn], .btn[data-trigger]').forEach(bindHoldButton);
+
+        // Debug overlay toggle
+        const dbgEl = document.getElementById('debug');
+        document.getElementById('debug-toggle').addEventListener('pointerdown', (e) => {
+            e.preventDefault(); e.stopPropagation();
+            dbgEl.classList.toggle('hidden');
         });
 
-        const leftStick = nipplejs.create({
-            zone: document.getElementById('left-stick-zone'),
-            mode: 'static',
-            position: { left: '50%', bottom: '50%' },
-            color: 'rgba(255,255,255,0.5)',
-            size: 130
-        });
-        leftStick.on('move', (evt, data) => {
-            const x = Math.cos(data.angle.radian) * (data.distance / 65);
-            const y = Math.sin(data.angle.radian) * (data.distance / 65);
-            sendInput('axis', 'LeftStick', { x, y });
-        });
-        leftStick.on('end', () => sendInput('axis', 'LeftStick', { x: 0, y: 0 }));
-
-        ['left-stick-zone'].forEach(id => {
-            const el = document.getElementById(id);
+        // Helper to build an analog stick that reports to a given axis.
+        function makeStick(zoneId, axisName) {
+            const stick = nipplejs.create({
+                zone: document.getElementById(zoneId),
+                mode: 'static',
+                position: { left: '50%', bottom: '50%' },
+                color: 'rgba(255,255,255,0.5)',
+                size: 130
+            });
+            stick.on('move', (evt, data) => {
+                const x = Math.cos(data.angle.radian) * (data.distance / 65);
+                const y = Math.sin(data.angle.radian) * (data.distance / 65);
+                sendInput('axis', axisName, { x, y });
+            });
+            stick.on('end', () => sendInput('axis', axisName, { x: 0, y: 0 }));
+            // Keep stick touches out of the screen-touch layer.
+            const el = document.getElementById(zoneId);
             el.addEventListener('touchstart', e => e.stopPropagation(), { passive: true });
             el.addEventListener('touchmove', e => e.stopPropagation(), { passive: true });
             el.addEventListener('touchend', e => e.stopPropagation(), { passive: true });
-        });
+            return stick;
+        }
+
+        const leftStick = makeStick('left-stick-zone', 'LeftStick');
+        const rightStick = makeStick('right-stick-zone', 'RightStick');
 
         const container = document.getElementById("container");
         container.addEventListener('touchstart', (e) => {
@@ -518,6 +757,7 @@
         // Update dashboard every second
         setInterval(async () => {
             await fetchRTCStats();
+            rollupSecond();
             updateDebug();
         }, 1000);
         updateDebug();

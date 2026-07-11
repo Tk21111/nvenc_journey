@@ -43,6 +43,7 @@ struct Peer {
     shared_ptr<PeerConnection> pc;
     shared_ptr<DataChannel> dc;
     shared_ptr<Track> videoTrack;
+    shared_ptr<DataChannel> telemetry; // per-frame observation log (server -> client)
 };
 
 map<shared_ptr<WebSocket>, Peer> peers;
@@ -64,6 +65,16 @@ void BroadcastMetrics(double cpu, double gpu) {
     for (auto const& [ws, peer] : peers) {
         if (peer.dc && peer.dc->isOpen()) {
             peer.dc->send(msg);
+        }
+    }
+}
+
+// Helper to broadcast a per-frame telemetry record on the dedicated channel
+void BroadcastTelemetry(const std::string& msg) {
+    std::lock_guard<std::mutex> lock(peersMutex);
+    for (auto const& [ws, peer] : peers) {
+        if (peer.telemetry && peer.telemetry->isOpen()) {
+            peer.telemetry->send(msg);
         }
     }
 }
@@ -155,6 +166,13 @@ int main() {
         {
             std::lock_guard<std::mutex> lock(peersMutex);
             peers[ws].dc = dc;
+        }
+
+        // --- Setup Telemetry Channel (separate from input so it never competes) ---
+        auto tdc = pc->createDataChannel("telemetry");
+        {
+            std::lock_guard<std::mutex> lock(peersMutex);
+            peers[ws].telemetry = tdc;
         }
 
         dc->onOpen([dc](){
@@ -339,8 +357,19 @@ int main() {
 
     cout << "Starting Video Capture & Stream loop..." << endl;
 
-    const auto frameDuration = std::chrono::microseconds(33333); 
+    const auto frameDuration = std::chrono::microseconds(33333);
     auto nextFrameTime = std::chrono::steady_clock::now();
+
+    // --- Observation log setup ---
+    const auto progStart = std::chrono::steady_clock::now();
+    auto prevCap0 = progStart;
+    uint64_t frameId = 0;
+    std::ofstream perfLog("perf_log.csv");
+    perfLog << "id,sendMs,capUs,encUs,pipeUs,bytes,idr,dtUs\n";
+    auto usSince = [](std::chrono::steady_clock::time_point a,
+                      std::chrono::steady_clock::time_point b) {
+        return (long long)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+    };
 
     while (true) {
         // --- HIGH PRECISION PACER ---
@@ -372,19 +401,24 @@ int main() {
             nextFrameTime = now + frameDuration;
         }
 
+        // --- Telemetry: mark start of this frame (capture) ---
+        auto tCap0 = std::chrono::steady_clock::now();
+        long long dtUs = usSince(prevCap0, tCap0); // real inter-frame interval
+        prevCap0 = tCap0;
+
         DXGI_OUTDUPL_FRAME_INFO frameInfo;
         ComPtr<IDXGIResource> pDesktopResource;
-        
+
         HRESULT acquireResult = pDuplication->AcquireNextFrame(0, &frameInfo, &pDesktopResource);
-        
+
         if (SUCCEEDED(acquireResult)) {
             ComPtr<ID3D11Texture2D> pAcquiredTex;
             pDesktopResource.As(&pAcquiredTex);
-            
+
             // This copy now works perfectly because NVENC is not locking the texture!
             pContext->CopyResource(pEncodeTexture.Get(), pAcquiredTex.Get());
             pDuplication->ReleaseFrame();
-        } 
+        }
         else if (acquireResult != DXGI_ERROR_WAIT_TIMEOUT) {
             cerr << "Lost DXGI capture. Needs reinitialization." << endl;
             break; 
@@ -409,20 +443,39 @@ int main() {
             forceIDR = false;
         }
 
+        // --- Telemetry: encode timing ---
+        long long capUs = usSince(tCap0, std::chrono::steady_clock::now());
+        auto tEnc0 = std::chrono::steady_clock::now();
+
         CK_NVENC(nv.nvEncEncodePicture(hEncoder, &pic));
 
         NV_ENC_LOCK_BITSTREAM lock = { NV_ENC_LOCK_BITSTREAM_VER };
         lock.outputBitstream = cb.bitstreamBuffer;
         CK_NVENC(nv.nvEncLockBitstream(hEncoder, &lock));
 
+        auto tReady = std::chrono::steady_clock::now();
+        long long encUs  = usSince(tEnc0, tReady);   // encode + lock cost
+        long long pipeUs = usSince(tCap0, tReady);   // full capture -> ready-to-send
+        double    sendMs = std::chrono::duration<double, std::milli>(tReady - progStart).count();
+        bool      isIdr  = (lock.pictureType == NV_ENC_PIC_TYPE_IDR);
+        uint64_t  bytes  = lock.bitstreamSizeInBytes;
+
         if (lock.bitstreamSizeInBytes > 0) {
             BroadcastH264Frame(lock.bitstreamBufferPtr, lock.bitstreamSizeInBytes);
 
-            // Send to FFplay
-            // if (hPipe != INVALID_HANDLE_VALUE) {
-            //     DWORD bytesWritten;
-            //     WriteFile(hPipe, lock.bitstreamBufferPtr, lock.bitstreamSizeInBytes, &bytesWritten, NULL);
-            // }
+            // Push a compact per-frame record to the client on the telemetry channel...
+            json rec = {
+                {"t", "f"}, {"id", frameId}, {"capUs", capUs}, {"encUs", encUs},
+                {"pipeUs", pipeUs}, {"bytes", bytes}, {"idr", isIdr ? 1 : 0},
+                {"dtUs", dtUs}, {"sendMs", sendMs}
+            };
+            BroadcastTelemetry(rec.dump());
+
+            // ...and to the on-disk CSV for offline analysis.
+            perfLog << frameId << ',' << sendMs << ',' << capUs << ',' << encUs << ','
+                    << pipeUs << ',' << bytes << ',' << (isIdr ? 1 : 0) << ',' << dtUs << '\n';
+            if ((frameId % 30) == 0) perfLog.flush();
+            frameId++;
         }
 
         CK_NVENC(nv.nvEncUnlockBitstream(hEncoder, cb.bitstreamBuffer));
