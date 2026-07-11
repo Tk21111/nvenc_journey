@@ -50,6 +50,12 @@ map<shared_ptr<WebSocket>, Peer> peers;
 std::mutex peersMutex; // Protects the peers map from cross-thread crashes
 std::atomic<bool> forceIDR{false};
 
+// --- Adaptive bitrate (client decides, capture thread applies) ---
+// Single-client assumption: one target shared globally.
+constexpr uint32_t BITRATE_START = 5000000;
+std::atomic<uint32_t> g_targetBitrate{BITRATE_START};
+std::atomic<bool>     g_bitrateDirty{false};
+
 // Resource Monitoring
 double peakCpu = 0;
 double peakGpu = 0;
@@ -175,35 +181,30 @@ int main() {
             peers[ws].telemetry = tdc;
         }
 
-        dc->onOpen([dc](){
-            cout << "[dataCh] open\n";
-            dc->send("Hello from Server");
-            dc->send("aaa");
+        dc->onOpen([](){
+            cout << "[dataCh] input channel open\n";
         });
 
         dc->onMessage([&] (rtc::message_variant msg){
-            // Only handle binary messages
+            // Text messages = control (e.g. adaptive-bitrate requests from the client).
+            if (std::holds_alternative<rtc::string>(msg)) {
+                try {
+                    auto j = json::parse(std::get<rtc::string>(msg));
+                    if (j.value("type", "") == "bitrate") {
+                        g_targetBitrate = j.value("bps", (uint32_t)BITRATE_START);
+                        g_bitrateDirty = true;
+                    }
+                } catch (...) {}
+                return;
+            }
+
+            // Binary messages = 52-byte controller input packets.
             if (!std::holds_alternative<rtc::binary>(msg)) return;
-
             auto& data = std::get<rtc::binary>(msg);
-
-     
-                std::cout << "[peer] Packet #"
-                          << " - Size: " << data.size() 
-                          << " bytes (expected: " << sizeof(InputPacket) << ")\n" << std::endl;
-            
-
             if (data.size() < sizeof(InputPacket)) return;
 
             InputPacket packet{};
             std::memcpy(&packet, data.data(), sizeof(InputPacket));
-
-                std::cout << "[peer] Deserialized - lx:" << packet.lx 
-                          << " ly:" << packet.ly
-                          << " dx:" << packet.dx
-                          << " dy:" << packet.dy
-                          << " buttons:0x" << std::hex << (int)packet.buttons << std::dec
-                          << "\n" << std::endl;
 
             try {
                 controller.Update(packet);
@@ -212,7 +213,6 @@ int main() {
             catch (const std::exception& e) {
                 std::cerr << "OnInput callback error: " << e.what() << '\n';
             }
-            
         });
 
         pc->setLocalDescription();
@@ -383,6 +383,23 @@ int main() {
     };
 
     while (true) {
+        // --- Adaptive bitrate: apply the client's latest request (capture thread owns NVENC) ---
+        if (g_bitrateDirty.exchange(false)) {
+            uint32_t bps = g_targetBitrate.load();
+            // Only touch the bitrate. Leave vbvBufferSize/InitialDelay at their init values
+            // so rate-control state isn't reset on every tweak (avoids a reconfigure hitch).
+            initParams.encodeConfig->rcParams.averageBitRate = bps;
+            initParams.encodeConfig->rcParams.maxBitRate      = bps;
+
+            NV_ENC_RECONFIGURE_PARAMS recfg = { NV_ENC_RECONFIGURE_PARAMS_VER };
+            recfg.reInitEncodeParams = initParams;
+            NVENCSTATUS rc = nv.nvEncReconfigureEncoder(hEncoder, &recfg);
+            if (rc == NV_ENC_SUCCESS)
+                cout << "[abr] bitrate -> " << (bps / 1000) << " kbps\n";
+            else
+                cerr << "[abr] reconfigure failed: " << rc << "\n";
+        }
+
         DXGI_OUTDUPL_FRAME_INFO frameInfo;
         ComPtr<IDXGIResource> pDesktopResource;
 

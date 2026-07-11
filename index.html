@@ -58,17 +58,9 @@
         #left-stick-zone {
             position: absolute;
             left: calc(25% - 80px);
-            bottom: calc(20% - 80px);
+            bottom: calc(28% - 80px);
             width: 160px;
             height: 160px;
-        }
-
-        #right-stick-zone {
-            position: absolute;
-            left: calc(25% - 70px);
-            bottom: calc(20% - 70px);
-            width: 140px;
-            height: 140px;
         }
 
         .btn {
@@ -88,7 +80,7 @@
 
         .abxy-container {
             position: absolute;
-            bottom: 10%;
+            bottom: 18%;
             right: 10%;
             width: 170px;
             height: 170px;
@@ -158,34 +150,40 @@
         .btn-guide { left: calc(50% - 23px); border-color: var(--xbox-green); color: var(--xbox-green); border-radius: 50%; width: 40px; height: 40px; }
         .btn-menu  { left: calc(50% + 32px); }
 
-        /* D-pad (upper-left, above the left stick) */
-        .dpad {
-            position: absolute;
-            left: 4%;
-            bottom: 42%;
-            width: 150px;
-            height: 150px;
-            pointer-events: none;
-        }
-        .btn-dpad { width: 50px; height: 50px; border-radius: 10px; pointer-events: auto; font-size: 1.1rem; }
-        .d-up    { top: 0;   left: 50px; }
-        .d-down  { bottom: 0; left: 50px; }
-        .d-left  { left: 0;  top: 50px; }
-        .d-right { right: 0; top: 50px; }
-
         /* Stick-click buttons (L3 / R3) */
         .btn-stickclick { width: 46px; height: 46px; font-size: 0.8rem; }
-        .btn-l3 { left: 3%;  bottom: 20%; }
-        .btn-r3 { right: 3%; bottom: 20%; }
+        .btn-l3 { left: 3%;  bottom: 28%; }
+        .btn-r3 { right: 3%; bottom: 28%; }
 
-        /* Right analog stick zone (mirror of the left) */
-        #right-stick-zone {
+        /* D-pad — compact cross on the left (character swap) */
+        .dpad {
             position: absolute;
-            right: calc(24% - 80px);
-            left: auto;
-            bottom: calc(20% - 80px);
-            width: 160px;
-            height: 160px;
+            left: 2%;
+            bottom: 44%;
+            width: 126px;
+            height: 126px;
+            pointer-events: none;
+        }
+        .btn-dpad { width: 42px; height: 42px; border-radius: 9px; pointer-events: auto; font-size: 1rem; }
+        .d-up    { top: 0;    left: 42px; }
+        .d-down  { bottom: 0; left: 42px; }
+        .d-left  { left: 0;   top: 42px; }
+        .d-right { right: 0;  top: 42px; }
+
+        /* Center toggle: hide/show the whole controller overlay */
+        .container.hidden { display: none; }
+        #overlay-toggle {
+            position: fixed;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            width: 46px; height: 46px;
+            z-index: 101;
+            background: var(--bg-glass);
+            border: 1px solid rgba(255,255,255,0.35);
+            border-radius: 50%;
+            color: #fff; font-size: 1.2rem;
+            display: flex; align-items: center; justify-content: center;
+            opacity: 0.55;
         }
     </style>
 </head>
@@ -193,6 +191,7 @@
 
     <div id="debug" class="hidden">Initializing Resource Monitor...</div>
     <div id="debug-toggle">≡</div>
+    <div id="overlay-toggle">🎮</div>
 
     <div class="container" id="container">
         <!-- Shoulders + triggers -->
@@ -207,7 +206,7 @@
         <div class="btn btn-sys btn-menu"  data-btn="Start">&#9776;</div>
 
         <div id="left-zone">
-            <!-- D-pad -->
+            <!-- D-pad (character swap) -->
             <div class="dpad">
                 <div class="btn btn-dpad d-up"    data-btn="Up">&#9650;</div>
                 <div class="btn btn-dpad d-down"  data-btn="Down">&#9660;</div>
@@ -219,7 +218,9 @@
         </div>
 
         <div id="right-zone">
-            <div id="right-stick-zone"></div>
+            <!-- Right stick removed: the right side is now a touch-camera area (native
+                 touch-look). The container touch handlers below capture it on the base
+                 layer, so these buttons still sit on top. -->
             <div class="btn btn-stickclick btn-r3" data-btn="R3">R3</div>
             <div class="abxy-container">
                 <div class="btn btn-action btn-y" data-btn="Y">Y</div>
@@ -274,6 +275,50 @@
         let lastServerFrame = null; // most recent per-frame record from server
         let lastRow = null;         // most recent 1s rollup (for the overlay)
         const logRows = [];         // downloadable client-side log
+
+        // --- Adaptive bitrate (client decides from network, server applies) ---
+        // Reconfiguring NVENC costs a frame, so we change RARELY and GENTLY:
+        //  - hysteresis: only act on *sustained* conditions (streaks), not one noisy tick
+        //  - rate-limit: at most one change every few seconds
+        //  - gentle steps: small deltas so each reconfigure is cheap and invisible
+        const abr = {
+            bps: 5000000, min: 1500000, max: 8000000,
+            tick: 0, lossStreak: 0, cleanStreak: 0, lastChangeTick: -99,
+        };
+        const ABR_COOLDOWN = 3;   // ticks (~seconds) between changes
+        const ABR_DROP_AFTER = 2; // sustained loss ticks before backing off
+        const ABR_RISE_AFTER = 4; // sustained clean ticks before probing up
+
+        function adaptBitrate() {
+            abr.tick++;
+            if (abr.tick < 3) return;               // skip ~first 2s (warmup / IDR burst)
+            if (!dataChannel || dataChannel.readyState !== 'open') return;
+
+            const loss = netRate.lossPct;
+            const usingBps = netRate.recvMbps * 1e6; // what we're actually pushing
+
+            // Track how long the condition has held (hysteresis).
+            abr.lossStreak  = (loss > 2.0) ? abr.lossStreak + 1 : 0;
+            abr.cleanStreak = (loss < 0.5) ? abr.cleanStreak + 1 : 0;
+
+            // Rate-limit: don't reconfigure more often than the cooldown.
+            if (abr.tick - abr.lastChangeTick < ABR_COOLDOWN) return;
+
+            let next = abr.bps;
+            if (abr.lossStreak >= ABR_DROP_AFTER) {
+                next = abr.bps - 1000000;                                  // gentle -1 Mbps
+            } else if (abr.cleanStreak >= ABR_RISE_AFTER && usingBps > abr.bps * 0.6) {
+                next = abr.bps + 500000;                                   // gentle +0.5 Mbps
+            }
+            next = Math.max(abr.min, Math.min(abr.max, Math.round(next)));
+
+            if (Math.abs(next - abr.bps) >= 250000) {   // deadband
+                abr.bps = next;
+                abr.lastChangeTick = abr.tick;
+                abr.lossStreak = 0; abr.cleanStreak = 0; // reset after acting
+                try { dataChannel.send(JSON.stringify({ type: 'bitrate', bps: abr.bps })); } catch (_) {}
+            }
+        }
 
         function setupTelemetry(ch) {
             ch.onopen = () => console.log('[RTC] telemetry channel open');
@@ -414,6 +459,7 @@
         WS:  ${socket.readyState === 1 ? 'Connected' : 'Disconnected'} | RTC: ${pc?.connectionState || 'N/A'}<br>
         Loss: ${r.lossPct ?? '-'}%${lossFlag} | Jit: ${r.jitterMs ?? '-'}ms | Frz: ${r.freezes ?? '-'}<br>
         Recv: ${r.recvMbps ?? '-'} / Sent: ${r.srvMbps ?? '-'} Mbps<br>
+        ABR: ${(abr.bps / 1e6).toFixed(1)} Mbps target<br>
         PLI/s: ${r.pli ?? '-'} | NACK/s: ${r.nack ?? '-'} | Dec: ${r.decFps ?? '-'}fps<br>
         === PIPELINE (server) ===<br>
         Enc: ${r.encMsAvg ?? '-'}/${r.encMsMax ?? '-'}ms | Pipe: ${r.pipeMsAvg ?? '-'}/${r.pipeMsMax ?? '-'}ms<br>
@@ -671,6 +717,13 @@
             dbgEl.classList.toggle('hidden');
         });
 
+        // Controller overlay toggle (center button) — hide/show all gamepad controls.
+        const containerEl = document.getElementById('container');
+        document.getElementById('overlay-toggle').addEventListener('pointerdown', (e) => {
+            e.preventDefault(); e.stopPropagation();
+            containerEl.classList.toggle('hidden');
+        });
+
         // Helper to build an analog stick that reports to a given axis.
         function makeStick(zoneId, axisName) {
             const stick = nipplejs.create({
@@ -695,7 +748,7 @@
         }
 
         const leftStick = makeStick('left-stick-zone', 'LeftStick');
-        const rightStick = makeStick('right-stick-zone', 'RightStick');
+        // Right stick removed — right side is a touch-camera pad (see container handlers).
 
         const container = document.getElementById("container");
         container.addEventListener('touchstart', (e) => {
@@ -707,7 +760,8 @@
             sendPacket();
         }, { passive: true });
         
-        const SMOOTHING = 0.15;
+        // Camera smoothing: lower = smoother (less jitter) but more lag. 1.0 = off.
+        const SMOOTHING = 0.4;
         container.addEventListener('touchmove', (e) => {
             for (const t of e.changedTouches) {
                 const slot = getSlot(t.identifier);
@@ -758,6 +812,7 @@
         setInterval(async () => {
             await fetchRTCStats();
             rollupSecond();
+            adaptBitrate();
             updateDebug();
         }, 1000);
         updateDebug();
