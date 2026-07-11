@@ -292,7 +292,9 @@ int main() {
     initParams.encodeWidth = 1920;
     initParams.encodeHeight = 1080;
     initParams.tuningInfo = NV_ENC_TUNING_INFO_LOW_LATENCY;
-    initParams.frameRateNum = 30;
+    // ==== Single frame-rate knob: change this one line to switch 30 <-> 60 fps ====
+    const int TARGET_FPS = 60;
+    initParams.frameRateNum = TARGET_FPS;
     initParams.frameRateDen = 1;
     initParams.enablePTD = 1;
 
@@ -309,10 +311,10 @@ int main() {
     initParams.encodeConfig = &presetConfig.presetCfg;    
     initParams.encodeConfig->profileGUID = NV_ENC_H264_PROFILE_BASELINE_GUID;
 
-    // Keyframe safety net: bound worst-case corruption from a lost packet to ~2s
-    // (instead of 10s). On-demand recovery is handled faster by the PLI handler above.
-    initParams.encodeConfig->gopLength = 60;
-    initParams.encodeConfig->encodeCodecConfig.h264Config.idrPeriod = 60;
+    // Keyframe safety net ~every 2s (bounds worst-case corruption from a lost packet).
+    // On-demand recovery is handled faster by the PLI handler.
+    initParams.encodeConfig->gopLength = TARGET_FPS * 2;
+    initParams.encodeConfig->encodeCodecConfig.h264Config.idrPeriod = TARGET_FPS * 2;
     initParams.encodeConfig->encodeCodecConfig.h264Config.repeatSPSPPS = 1;
     // Prevent NVENC from injecting AUD NAL units, which confuse WebRTC packetizers
     initParams.encodeConfig->encodeCodecConfig.h264Config.outputAUD = 0;
@@ -323,9 +325,10 @@ int main() {
     initParams.encodeConfig->rcParams.averageBitRate = 5000000;
     initParams.encodeConfig->rcParams.maxBitRate = 5000000;
     
-    // Set VBV buffer size tight for low latency (averageBitRate / framerate)
-    initParams.encodeConfig->rcParams.vbvBufferSize = 5000000 / 30;
-    initParams.encodeConfig->rcParams.vbvInitialDelay = 5000000 / 30;
+    // Set VBV buffer size tight for low latency (averageBitRate / framerate).
+    // One-frame VBV keeps frame sizes even -> smoother pacing, less bursty loss.
+    initParams.encodeConfig->rcParams.vbvBufferSize = 5000000 / TARGET_FPS;
+    initParams.encodeConfig->rcParams.vbvInitialDelay = 5000000 / TARGET_FPS;
 
     CK_NVENC(nv.nvEncInitializeEncoder(hEncoder, &initParams));
 
@@ -357,12 +360,20 @@ int main() {
 
     cout << "Starting Video Capture & Stream loop..." << endl;
 
-    const auto frameDuration = std::chrono::microseconds(33333);
-    auto nextFrameTime = std::chrono::steady_clock::now();
+    // --- 60 fps target on a 60 Hz display: event-driven, send-on-encode ---
+    // We no longer pace to a fixed grid. AcquireNextFrame BLOCKS until Windows signals a
+    // new desktop frame, so a screen change is captured the instant it happens and sent
+    // immediately -- no grid wait, no beat jitter. On a static screen we sleep in the OS
+    // wait and emit nothing (the client just holds the last frame).
+    const auto minFrameInterval = std::chrono::microseconds(1000000 / TARGET_FPS); // fps cap
+    const UINT ACQUIRE_TIMEOUT_MS = 100; // heartbeat: how long we block; also bounds how fast
+                                         // a forced keyframe (PLI / new client) is serviced when idle
 
     // --- Observation log setup ---
     const auto progStart = std::chrono::steady_clock::now();
     auto prevCap0 = progStart;
+    auto lastSend = progStart;
+    bool haveCaptured = false;
     uint64_t frameId = 0;
     std::ofstream perfLog("perf_log.csv");
     perfLog << "id,sendMs,capUs,encUs,pipeUs,bytes,idr,dtUs\n";
@@ -372,57 +383,44 @@ int main() {
     };
 
     while (true) {
-        // --- HIGH PRECISION PACER ---
-        auto now = std::chrono::steady_clock::now();
-        
-        if (now < nextFrameTime) {
-            auto timeRemaining = std::chrono::duration_cast<std::chrono::milliseconds>(nextFrameTime - now).count();
-            
-            // If we have more than 2ms to wait, let the CPU rest (safely, since we boosted the timer)
-            if (timeRemaining > 2) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                continue;
-            } else {
-                // We are less than 2ms away! Spin-wait for perfect microsecond accuracy
-                while (std::chrono::steady_clock::now() < nextFrameTime) {
-                    std::this_thread::yield(); 
-                }
-            }
-        }
-        
-        // Advance the clock by one frame to keep a steady cadence
-        nextFrameTime += frameDuration;
-
-        // Anti-burst: if capture/encode fell behind (nextFrameTime already in the past),
-        // resync the cadence instead of firing frames back-to-back to "catch up".
-        // Bursting a backlog of frames is a primary cause of UDP packet loss over WiFi.
-        now = std::chrono::steady_clock::now();
-        if (now > nextFrameTime) {
-            nextFrameTime = now + frameDuration;
-        }
-
-        // --- Telemetry: mark start of this frame (capture) ---
-        auto tCap0 = std::chrono::steady_clock::now();
-        long long dtUs = usSince(prevCap0, tCap0); // real inter-frame interval
-        prevCap0 = tCap0;
-
         DXGI_OUTDUPL_FRAME_INFO frameInfo;
         ComPtr<IDXGIResource> pDesktopResource;
 
-        HRESULT acquireResult = pDuplication->AcquireNextFrame(0, &frameInfo, &pDesktopResource);
+        // Block until the desktop actually changes (event-driven), up to the heartbeat.
+        HRESULT acquireResult = pDuplication->AcquireNextFrame(ACQUIRE_TIMEOUT_MS, &frameInfo, &pDesktopResource);
 
-        if (SUCCEEDED(acquireResult)) {
+        bool haveNew = SUCCEEDED(acquireResult);
+        if (!haveNew && acquireResult != DXGI_ERROR_WAIT_TIMEOUT) {
+            cerr << "Lost DXGI capture. Needs reinitialization." << endl;
+            break;
+        }
+
+        if (haveNew) {
             ComPtr<ID3D11Texture2D> pAcquiredTex;
             pDesktopResource.As(&pAcquiredTex);
-
-            // This copy now works perfectly because NVENC is not locking the texture!
             pContext->CopyResource(pEncodeTexture.Get(), pAcquiredTex.Get());
             pDuplication->ReleaseFrame();
+            haveCaptured = true;
         }
-        else if (acquireResult != DXGI_ERROR_WAIT_TIMEOUT) {
-            cerr << "Lost DXGI capture. Needs reinitialization." << endl;
-            break; 
+
+        // What to emit this iteration:
+        //   new desktop content -> always send
+        //   static screen       -> send only to service a forced keyframe (PLI / new client)
+        bool idrRequested = forceIDR.load();
+        if (!haveCaptured)              continue; // nothing captured yet
+        if (!haveNew && !idrRequested) continue; // static screen, nothing to do -> block again
+
+        // 60 fps cap: never emit faster than the target interval. On a 60 Hz display frames
+        // already arrive ~16.6 ms apart, so this only bites on higher-refresh displays.
+        auto sinceSend = std::chrono::steady_clock::now() - lastSend;
+        if (haveNew && !idrRequested && sinceSend < minFrameInterval) {
+            std::this_thread::sleep_for(minFrameInterval - sinceSend);
         }
+
+        // --- Telemetry: mark start of this frame's pipeline ---
+        auto tCap0 = std::chrono::steady_clock::now();
+        long long dtUs = usSince(prevCap0, tCap0); // real inter-frame interval (content-driven now)
+        prevCap0 = tCap0;
 
         // --- GPU DEADLOCK FIX: Map the texture just before encoding ---
         NV_ENC_MAP_INPUT_RESOURCE map = { NV_ENC_MAP_INPUT_RESOURCE_VER };
@@ -438,7 +436,7 @@ int main() {
         pic.outputBitstream = cb.bitstreamBuffer;
 
         pic.encodePicFlags = 0;
-        if (forceIDR) {
+        if (idrRequested) {
             pic.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
             forceIDR = false;
         }
@@ -462,6 +460,7 @@ int main() {
 
         if (lock.bitstreamSizeInBytes > 0) {
             BroadcastH264Frame(lock.bitstreamBufferPtr, lock.bitstreamSizeInBytes);
+            lastSend = tReady; // for the 60 fps cap
 
             // Push a compact per-frame record to the client on the telemetry channel...
             json rec = {
