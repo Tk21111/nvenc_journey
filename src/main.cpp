@@ -8,6 +8,7 @@
 
 #include <rtc/rtc.hpp>
 #include <rtc/h264rtppacketizer.hpp>
+#include <rtc/plihandler.hpp>
 #include <nlohmann/json.hpp>
 #include "input/controller.hpp"
 #include "input/touch.hpp"
@@ -123,6 +124,15 @@ int main() {
         auto packetizer = std::make_shared<rtc::H264RtpPacketizer>(
             rtc::NalUnit::Separator::StartSequence, rtpConfig
         );
+        // Respond to the client's Picture Loss Indication (PLI/FIR) by forcing an IDR.
+        // This is how we recover *immediately* when the phone detects a corrupt frame,
+        // instead of waiting for the next scheduled keyframe.
+        auto pliHandler = std::make_shared<rtc::PliHandler>([]() {
+            std::cout << "[WebRTC] PLI received -> forcing keyframe\n";
+            forceIDR = true;
+        });
+        packetizer->addToChain(pliHandler);
+
         videoTrack->setMediaHandler(packetizer);
 
         {
@@ -281,8 +291,10 @@ int main() {
     initParams.encodeConfig = &presetConfig.presetCfg;    
     initParams.encodeConfig->profileGUID = NV_ENC_H264_PROFILE_BASELINE_GUID;
 
-    initParams.encodeConfig->gopLength = 300;            
-    initParams.encodeConfig->encodeCodecConfig.h264Config.idrPeriod = 300;
+    // Keyframe safety net: bound worst-case corruption from a lost packet to ~2s
+    // (instead of 10s). On-demand recovery is handled faster by the PLI handler above.
+    initParams.encodeConfig->gopLength = 60;
+    initParams.encodeConfig->encodeCodecConfig.h264Config.idrPeriod = 60;
     initParams.encodeConfig->encodeCodecConfig.h264Config.repeatSPSPPS = 1;
     // Prevent NVENC from injecting AUD NAL units, which confuse WebRTC packetizers
     initParams.encodeConfig->encodeCodecConfig.h264Config.outputAUD = 0;
@@ -349,8 +361,16 @@ int main() {
             }
         }
         
-        // Advance the clock strictly by 16.6ms to prevent drift
+        // Advance the clock by one frame to keep a steady cadence
         nextFrameTime += frameDuration;
+
+        // Anti-burst: if capture/encode fell behind (nextFrameTime already in the past),
+        // resync the cadence instead of firing frames back-to-back to "catch up".
+        // Bursting a backlog of frames is a primary cause of UDP packet loss over WiFi.
+        now = std::chrono::steady_clock::now();
+        if (now > nextFrameTime) {
+            nextFrameTime = now + frameDuration;
+        }
 
         DXGI_OUTDUPL_FRAME_INFO frameInfo;
         ComPtr<IDXGIResource> pDesktopResource;
