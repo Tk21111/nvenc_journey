@@ -49,6 +49,7 @@ struct Peer {
 map<shared_ptr<WebSocket>, Peer> peers;
 std::mutex peersMutex; // Protects the peers map from cross-thread crashes
 std::atomic<bool> forceIDR{false};
+std::atomic<int64_t> g_lastPliMs{0}; // rate-limit PLI-forced keyframes (anti IDR-storm)
 
 // --- Adaptive bitrate (client decides, capture thread applies) ---
 // Single-client assumption: one target shared globally.
@@ -145,7 +146,13 @@ int main() {
         // This is how we recover *immediately* when the phone detects a corrupt frame,
         // instead of waiting for the next scheduled keyframe.
         auto pliHandler = std::make_shared<rtc::PliHandler>([]() {
-            std::cout << "[WebRTC] PLI received -> forcing keyframe\n";
+            // Cap PLI-forced keyframes to at most one per 500ms. A burst of PLIs (from a
+            // run of loss) would otherwise fire back-to-back IDRs and re-congest the link.
+            auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (nowMs - g_lastPliMs.load() < 500) return;
+            g_lastPliMs = nowMs;
+            std::cout << "[WebRTC] PLI -> forcing keyframe\n";
             forceIDR = true;
         });
         packetizer->addToChain(pliHandler);

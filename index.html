@@ -87,11 +87,13 @@
             pointer-events: none;
         }
 
+        /* Positioned with plain offsets (no centering transform) so the standard
+           .btn.pressed scale applies exactly like every other button. */
         .btn-action { width: 55px; height: 55px; pointer-events: auto; }
-        .btn-y { top: 0; left: 50%; transform: translateX(-50%); border-color: var(--xbox-yellow); color: var(--xbox-yellow); text-shadow: 0 0 5px rgba(0,0,0,0.8); }
-        .btn-a { bottom: 0; left: 50%; transform: translateX(-50%); border-color: var(--xbox-green); color: var(--xbox-green); text-shadow: 0 0 5px rgba(0,0,0,0.8); }
-        .btn-x { left: 0; top: 50%; transform: translateY(-50%); border-color: var(--xbox-blue); color: var(--xbox-blue); text-shadow: 0 0 5px rgba(0,0,0,0.8); }
-        .btn-b { right: 0; top: 50%; transform: translateY(-50%); border-color: var(--xbox-red); color: var(--xbox-red); text-shadow: 0 0 5px rgba(0,0,0,0.8); }
+        .btn-y { top: 0;    left: calc(50% - 27.5px); border-color: var(--xbox-yellow); color: var(--xbox-yellow); text-shadow: 0 0 5px rgba(0,0,0,0.8); }
+        .btn-a { bottom: 0; left: calc(50% - 27.5px); border-color: var(--xbox-green);  color: var(--xbox-green);  text-shadow: 0 0 5px rgba(0,0,0,0.8); }
+        .btn-x { left: 0;   top: calc(50% - 27.5px);  border-color: var(--xbox-blue);   color: var(--xbox-blue);   text-shadow: 0 0 5px rgba(0,0,0,0.8); }
+        .btn-b { right: 0;  top: calc(50% - 27.5px);  border-color: var(--xbox-red);    color: var(--xbox-red);    text-shadow: 0 0 5px rgba(0,0,0,0.8); }
 
         #debug {
             position: fixed;
